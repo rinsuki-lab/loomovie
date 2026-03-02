@@ -116,6 +116,7 @@ pub struct SourceDest {
 #[derive(Serialize)]
 pub struct SourceFile {
     pub source: String,
+    pub sha256: String,
     pub dest: SourceDest,
 }
 

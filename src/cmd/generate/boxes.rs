@@ -1,8 +1,8 @@
 // Generation of MP4 boxes: moov, moof, sidx, ftyp
 
-use crate::binary::*;
-use crate::mp4_box::*;
-use crate::types::*;
+use super::binary::*;
+use super::mp4_box::*;
+use super::types::*;
 
 // ===== Generate Combined moov =====
 
@@ -16,9 +16,7 @@ fn generate_mvhd(timescale: u32, next_track_id: u32) -> Vec<u8> {
     data.extend_from_slice(&[0x01, 0x00]); // volume = 1.0
     data.extend_from_slice(&[0u8; 10]); // reserved
     // Identity matrix
-    for &v in &[
-        0x00010000u32, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000,
-    ] {
+    for &v in &[0x00010000u32, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] {
         write_u32_be(&mut data, v);
     }
     data.extend_from_slice(&[0u8; 24]); // pre_defined
@@ -75,9 +73,10 @@ pub fn calc_chunk_moof_size(fragments: &[FragmentInfo]) -> usize {
     let has_sdi = fragments[0].tfhd.flags & 0x000002 != 0;
     let tfhd_size: usize = 12 + 4 + if has_sdi { 4 } else { 0 };
 
-    let tfdt_size: usize = fragments[0].tfdt.as_ref().map_or(0, |t| {
-        12 + if t.version == 0 { 4 } else { 8 }
-    });
+    let tfdt_size: usize = fragments[0]
+        .tfdt
+        .as_ref()
+        .map_or(0, |t| 12 + if t.version == 0 { 4 } else { 8 });
 
     let truns_total_size: usize = fragments.iter().map(calc_materialized_trun_size).sum();
 
@@ -89,14 +88,15 @@ pub fn calc_chunk_moof_size(fragments: &[FragmentInfo]) -> usize {
 ///
 /// Produces: moof { mfhd, traf { tfhd, tfdt, trun_0, trun_1, ..., trun_N } }
 ///
-/// Layout after this moof: [free_header(8)][original_file_bytes]
-/// Each trun_k's data_offset = moof_size + 8 + frag_k.moof_offset + frag_k.original_data_offset
+/// Layout after this moof: [free_header(8)][lmc1_header(16)][original_file_bytes]
+/// Each trun_k's data_offset = moof_size + pre_data_gap + frag_k.moof_offset + frag_k.original_data_offset
 pub fn generate_chunk_moof(
     sequence_number: u32,
     new_track_id: u32,
     fragments: &[FragmentInfo],
     trex: &TrackInfo,
     moof_size: usize,
+    pre_data_gap: usize,
 ) -> Vec<u8> {
     // mfhd
     let mut mfhd_data = Vec::new();
@@ -110,7 +110,10 @@ pub fn generate_chunk_moof(
     let mut tfhd_data = Vec::new();
     write_u32_be(&mut tfhd_data, new_track_id);
     if has_sdi {
-        write_u32_be(&mut tfhd_data, fragments[0].tfhd.sample_description_index.unwrap_or(1));
+        write_u32_be(
+            &mut tfhd_data,
+            fragments[0].tfhd.sample_description_index.unwrap_or(1),
+        );
     }
     let tfhd_box = make_fullbox(b"tfhd", 0, tfhd_flags, &tfhd_data);
 
@@ -131,11 +134,11 @@ pub fn generate_chunk_moof(
         let has_cts = fragment.trun.flags & 0x000800 != 0;
         // Always: data_offset + duration + size + flags; optionally cts
         // No first_sample_flags bit — we materialize it into per-sample flags
-        let trun_flags: u32 = 0x000001 | 0x000100 | 0x000200 | 0x000400
-            | if has_cts { 0x000800 } else { 0 };
+        let trun_flags: u32 =
+            0x000001 | 0x000100 | 0x000200 | 0x000400 | if has_cts { 0x000800 } else { 0 };
 
         let new_data_offset = moof_size as i32
-            + 8 // free header
+            + pre_data_gap as i32
             + fragment.moof_offset as i32
             + fragment.original_data_offset;
 
@@ -145,28 +148,38 @@ pub fn generate_chunk_moof(
 
         for (i, sample) in fragment.trun.samples.iter().enumerate() {
             // Duration: sample > tfhd default > trex default
-            let duration = sample.duration
-                .unwrap_or_else(|| fragment.tfhd.default_sample_duration
-                    .unwrap_or(trex.trex_default_sample_duration));
+            let duration = sample.duration.unwrap_or_else(|| {
+                fragment
+                    .tfhd
+                    .default_sample_duration
+                    .unwrap_or(trex.trex_default_sample_duration)
+            });
             write_u32_be(&mut trun_data, duration);
 
             // Size: sample > tfhd default > trex default
-            let size = sample.size
-                .unwrap_or_else(|| fragment.tfhd.default_sample_size
-                    .unwrap_or(trex.trex_default_sample_size));
+            let size = sample.size.unwrap_or_else(|| {
+                fragment
+                    .tfhd
+                    .default_sample_size
+                    .unwrap_or(trex.trex_default_sample_size)
+            });
             write_u32_be(&mut trun_data, size);
 
             // Flags: first_sample_flags (for i==0) > sample > tfhd default > trex default
             let flags = if i == 0 {
                 fragment.trun.first_sample_flags.unwrap_or_else(|| {
                     sample.flags.unwrap_or_else(|| {
-                        fragment.tfhd.default_sample_flags
+                        fragment
+                            .tfhd
+                            .default_sample_flags
                             .unwrap_or(trex.trex_default_sample_flags)
                     })
                 })
             } else {
                 sample.flags.unwrap_or_else(|| {
-                    fragment.tfhd.default_sample_flags
+                    fragment
+                        .tfhd
+                        .default_sample_flags
                         .unwrap_or(trex.trex_default_sample_flags)
                 })
             };
@@ -174,7 +187,10 @@ pub fn generate_chunk_moof(
 
             // Composition time offset
             if has_cts {
-                write_u32_be(&mut trun_data, sample.composition_time_offset_raw.unwrap_or(0));
+                write_u32_be(
+                    &mut trun_data,
+                    sample.composition_time_offset_raw.unwrap_or(0),
+                );
             }
         }
 
@@ -225,8 +241,7 @@ pub fn generate_sidx(
         let word1 = r.referenced_size & 0x7FFFFFFF;
         write_u32_be(&mut data, word1);
         write_u32_be(&mut data, r.subsegment_duration);
-        let word3 = ((r.starts_with_sap as u32) << 31)
-            | ((r.sap_type as u32 & 0x7) << 28);
+        let word3 = ((r.starts_with_sap as u32) << 31) | ((r.sap_type as u32 & 0x7) << 28);
         write_u32_be(&mut data, word3);
     }
     make_fullbox(b"sidx", 1, 0, &data)

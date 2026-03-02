@@ -1,6 +1,6 @@
 // Helper functions for sample analysis
 
-use crate::types::*;
+use super::types::*;
 
 /// Check if the first sample is a SAP (Stream Access Point / keyframe)
 pub fn is_first_sample_sap(trun: &TrunInfo, tfhd: &TfhdInfo, trex_default_flags: u32) -> bool {
@@ -23,7 +23,9 @@ pub fn is_first_sample_sap(trun: &TrunInfo, tfhd: &TfhdInfo, trex_default_flags:
 
 /// Calculate total sample duration for a single fragment's trun
 pub fn total_sample_duration(trun: &TrunInfo, tfhd: &TfhdInfo, trex_default_duration: u32) -> u64 {
-    let default_duration = tfhd.default_sample_duration.unwrap_or(trex_default_duration);
+    let default_duration = tfhd
+        .default_sample_duration
+        .unwrap_or(trex_default_duration);
     trun.samples
         .iter()
         .map(|s| s.duration.unwrap_or(default_duration) as u64)
@@ -31,10 +33,7 @@ pub fn total_sample_duration(trun: &TrunInfo, tfhd: &TfhdInfo, trex_default_dura
 }
 
 /// Calculate total duration across all fragments in a chunk for a given track
-pub fn total_chunk_duration(
-    fragments: &[FragmentInfo],
-    trex_default_duration: u32,
-) -> u64 {
+pub fn total_chunk_duration(fragments: &[FragmentInfo], trex_default_duration: u32) -> u64 {
     fragments
         .iter()
         .map(|frag| total_sample_duration(&frag.trun, &frag.tfhd, trex_default_duration))

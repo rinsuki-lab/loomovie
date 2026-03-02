@@ -2,9 +2,9 @@
 
 use tracing::{debug, trace};
 
-use crate::binary::*;
-use crate::mp4_box::*;
-use crate::types::*;
+use super::binary::*;
+use super::mp4_box::*;
+use super::types::*;
 
 // ===== Init Segment Parsing =====
 
@@ -25,11 +25,8 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
         let (tkhd_version, _, _) = fullbox_parse(tkhd_content);
 
         let track_id_field_offset = if tkhd_version == 0 { 8 } else { 16 };
-        let track_id_abs_offset = trak_header_size
-            + tkhd_info.offset
-            + tkhd_info.header_size
-            + 4
-            + track_id_field_offset;
+        let track_id_abs_offset =
+            trak_header_size + tkhd_info.offset + tkhd_info.header_size + 4 + track_id_field_offset;
 
         let mdia_info = find_box(trak_content, b"mdia").expect("mdia not found");
         let mdia_content = box_content(trak_content, &mdia_info);
@@ -231,28 +228,22 @@ pub fn parse_chunk(data: &[u8]) -> ChunkParseResult {
                 current_moof = Some(box_info.clone());
             }
             b"mdat" => {
-                let moof_box_info = current_moof
-                    .take()
-                    .expect("mdat without preceding moof");
+                let moof_box_info = current_moof.take().expect("mdat without preceding moof");
                 let moof_content = box_content(data, &moof_box_info);
 
-                let traf_info =
-                    find_box(moof_content, b"traf").expect("traf not found in moof");
+                let traf_info = find_box(moof_content, b"traf").expect("traf not found in moof");
                 let traf_content = box_content(moof_content, &traf_info);
 
-                let tfhd_box =
-                    find_box(traf_content, b"tfhd").expect("tfhd not found in traf");
+                let tfhd_box = find_box(traf_content, b"tfhd").expect("tfhd not found in traf");
                 let tfhd = parse_tfhd(box_content(traf_content, &tfhd_box));
 
                 let tfdt = find_box(traf_content, b"tfdt")
                     .map(|info| parse_tfdt(box_content(traf_content, &info)));
 
-                let trun_box =
-                    find_box(traf_content, b"trun").expect("trun not found in traf");
+                let trun_box = find_box(traf_content, b"trun").expect("trun not found in traf");
                 let trun = parse_trun(box_content(traf_content, &trun_box));
 
-                let original_data_offset =
-                    trun.data_offset.expect("trun data_offset required");
+                let original_data_offset = trun.data_offset.expect("trun data_offset required");
 
                 fragments.push(FragmentInfo {
                     moof_offset: moof_box_info.offset,
@@ -274,7 +265,10 @@ pub fn parse_chunk(data: &[u8]) -> ChunkParseResult {
         }
     }
 
-    assert!(!fragments.is_empty(), "no moof+mdat fragments found in chunk");
+    assert!(
+        !fragments.is_empty(),
+        "no moof+mdat fragments found in chunk"
+    );
     debug!(fragment_count = fragments.len(), file_size, "parsed chunk");
 
     ChunkParseResult {

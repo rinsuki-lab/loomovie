@@ -1,6 +1,6 @@
 // MP4 box parsing and construction utilities
 
-use crate::binary::*;
+use super::binary::*;
 
 #[derive(Debug, Clone)]
 pub struct BoxInfo {
@@ -68,8 +68,7 @@ pub fn box_raw<'a>(data: &'a [u8], info: &BoxInfo) -> &'a [u8] {
 
 pub fn fullbox_parse(content: &[u8]) -> (u8, u32, &[u8]) {
     let version = content[0];
-    let flags =
-        ((content[1] as u32) << 16) | ((content[2] as u32) << 8) | (content[3] as u32);
+    let flags = ((content[1] as u32) << 16) | ((content[2] as u32) << 8) | (content[3] as u32);
     (version, flags, &content[4..])
 }
 
