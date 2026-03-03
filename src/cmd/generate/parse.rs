@@ -13,45 +13,62 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
     let moov_content = box_content(data, &moov_info);
 
     let trak_info = find_box(moov_content, b"trak").expect("trak not found in moov");
-    let mut trak_raw = box_raw(moov_content, &trak_info).to_vec();
+    let trak_content = box_content(moov_content, &trak_info);
 
-    // Parse trak content (immutable borrow scope)
-    let (track_id_abs_offset, timescale, handler_type) = {
-        let trak_header_size = parse_box_at(&trak_raw, 0).unwrap().header_size;
-        let trak_content = &trak_raw[trak_header_size..];
-
-        let tkhd_info = find_box(trak_content, b"tkhd").expect("tkhd not found in trak");
-        let tkhd_content = box_content(trak_content, &tkhd_info);
-        let (tkhd_version, _, _) = fullbox_parse(tkhd_content);
-
-        let track_id_field_offset = if tkhd_version == 0 { 8 } else { 16 };
-        let track_id_abs_offset =
-            trak_header_size + tkhd_info.offset + tkhd_info.header_size + 4 + track_id_field_offset;
-
-        let mdia_info = find_box(trak_content, b"mdia").expect("mdia not found");
-        let mdia_content = box_content(trak_content, &mdia_info);
-
-        let mdhd_info = find_box(mdia_content, b"mdhd").expect("mdhd not found");
-        let mdhd_content = box_content(mdia_content, &mdhd_info);
-        let (mdhd_version, _, mdhd_data) = fullbox_parse(mdhd_content);
-        let timescale = if mdhd_version == 0 {
-            read_u32_be(mdhd_data, 8)
-        } else {
-            read_u32_be(mdhd_data, 16)
-        };
-
-        let hdlr_info = find_box(mdia_content, b"hdlr").expect("hdlr not found");
-        let hdlr_content = box_content(mdia_content, &hdlr_info);
-        let (_, _, hdlr_data) = fullbox_parse(hdlr_content);
-        let handler_type: [u8; 4] = hdlr_data[4..8].try_into().unwrap();
-
-        (track_id_abs_offset, timescale, handler_type)
-    };
-
-    // Patch track_id (mutable borrow)
-    trak_raw[track_id_abs_offset..track_id_abs_offset + 4]
+    // ---- Extract tkhd and patch track_id ----
+    let tkhd_info = find_box(trak_content, b"tkhd").expect("tkhd not found in trak");
+    let mut tkhd_raw = box_raw(trak_content, &tkhd_info).to_vec();
+    let tkhd_content = box_content(trak_content, &tkhd_info);
+    let (tkhd_version, _, _) = fullbox_parse(tkhd_content);
+    // track_id field offset within the tkhd box
+    let track_id_within_box =
+        tkhd_info.header_size + 4 + if tkhd_version == 0 { 8 } else { 16 };
+    tkhd_raw[track_id_within_box..track_id_within_box + 4]
         .copy_from_slice(&new_track_id.to_be_bytes());
 
+    // ---- Extract mdia children ----
+    let mdia_info = find_box(trak_content, b"mdia").expect("mdia not found in trak");
+    let mdia_content = box_content(trak_content, &mdia_info);
+
+    let mdhd_info = find_box(mdia_content, b"mdhd").expect("mdhd not found in mdia");
+    let mdhd_raw = box_raw(mdia_content, &mdhd_info).to_vec();
+    let mdhd_content = box_content(mdia_content, &mdhd_info);
+    let (mdhd_version, _, mdhd_data) = fullbox_parse(mdhd_content);
+    let timescale = if mdhd_version == 0 {
+        read_u32_be(mdhd_data, 8)
+    } else {
+        read_u32_be(mdhd_data, 16)
+    };
+
+    let hdlr_info = find_box(mdia_content, b"hdlr").expect("hdlr not found in mdia");
+    let hdlr_raw = box_raw(mdia_content, &hdlr_info).to_vec();
+    let hdlr_content = box_content(mdia_content, &hdlr_info);
+    let (_, _, hdlr_data) = fullbox_parse(hdlr_content);
+    let handler_type: [u8; 4] = hdlr_data[4..8].try_into().unwrap();
+
+    // ---- Extract minf children ----
+    let minf_info = find_box(mdia_content, b"minf").expect("minf not found in mdia");
+    let minf_content = box_content(mdia_content, &minf_info);
+
+    let media_header_raw = if let Some(vmhd) = find_box(minf_content, b"vmhd") {
+        box_raw(minf_content, &vmhd).to_vec()
+    } else if let Some(smhd) = find_box(minf_content, b"smhd") {
+        box_raw(minf_content, &smhd).to_vec()
+    } else if let Some(nmhd) = find_box(minf_content, b"nmhd") {
+        box_raw(minf_content, &nmhd).to_vec()
+    } else {
+        panic!("No media header (vmhd/smhd/nmhd) found in minf");
+    };
+
+    let dinf_info = find_box(minf_content, b"dinf").expect("dinf not found in minf");
+    let dinf_raw = box_raw(minf_content, &dinf_info).to_vec();
+
+    let stbl_info = find_box(minf_content, b"stbl").expect("stbl not found in minf");
+    let stbl_content = box_content(minf_content, &stbl_info);
+    let stsd_info = find_box(stbl_content, b"stsd").expect("stsd not found in stbl");
+    let stsd_raw = box_raw(stbl_content, &stsd_info).to_vec();
+
+    // ---- Parse trex defaults ----
     let mvex_info = find_box(moov_content, b"mvex").expect("mvex not found");
     let mvex_content = box_content(moov_content, &mvex_info);
     let trex_info = find_box(mvex_content, b"trex").expect("trex not found");
@@ -62,7 +79,12 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
         new_track_id,
         timescale,
         handler_type,
-        trak_raw,
+        tkhd_raw,
+        mdhd_raw,
+        hdlr_raw,
+        media_header_raw,
+        dinf_raw,
+        stsd_raw,
         trex_default_sample_description_index: read_u32_be(trex_data, 4),
         trex_default_sample_duration: read_u32_be(trex_data, 8),
         trex_default_sample_size: read_u32_be(trex_data, 12),

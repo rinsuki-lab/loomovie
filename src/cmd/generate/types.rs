@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct TfhdInfo {
     #[allow(dead_code)]
     pub track_id: u32,
+    #[allow(dead_code)]
     pub flags: u32,
     #[allow(dead_code)]
     pub base_data_offset: Option<u64>,
+    #[allow(dead_code)]
     pub sample_description_index: Option<u32>,
     pub default_sample_duration: Option<u32>,
     pub default_sample_size: Option<u32>,
@@ -18,6 +20,7 @@ pub struct TfhdInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TfdtInfo {
     pub version: u8,
     pub base_media_decode_time: u64,
@@ -34,6 +37,7 @@ pub struct TrunSample {
 #[derive(Debug, Clone)]
 pub struct TrunInfo {
     pub version: u8,
+    #[allow(dead_code)]
     pub flags: u32,
     pub sample_count: u32,
     #[allow(dead_code)]
@@ -46,12 +50,22 @@ pub struct TrunInfo {
 pub struct TrackInfo {
     pub new_track_id: u32,
     pub timescale: u32,
-    #[allow(dead_code)]
     pub handler_type: [u8; 4],
-    pub trak_raw: Vec<u8>,
+    /// Raw tkhd box (with track_id already patched)
+    pub tkhd_raw: Vec<u8>,
+    /// Raw mdhd box
+    pub mdhd_raw: Vec<u8>,
+    /// Raw hdlr box
+    pub hdlr_raw: Vec<u8>,
+    /// Raw media header box (vmhd, smhd, or nmhd)
+    pub media_header_raw: Vec<u8>,
+    /// Raw dinf box
+    pub dinf_raw: Vec<u8>,
+    /// Raw stsd box
+    pub stsd_raw: Vec<u8>,
+    #[allow(dead_code)]
     pub trex_default_sample_description_index: u32,
     pub trex_default_sample_duration: u32,
-    #[allow(dead_code)]
     pub trex_default_sample_size: u32,
     pub trex_default_sample_flags: u32,
 }
@@ -66,6 +80,7 @@ pub struct FragmentInfo {
     /// Parsed tfhd
     pub tfhd: TfhdInfo,
     /// Parsed tfdt
+    #[allow(dead_code)]
     pub tfdt: Option<TfdtInfo>,
     /// Parsed trun
     pub trun: TrunInfo,
@@ -80,13 +95,26 @@ pub struct ChunkParseResult {
     pub fragments: Vec<FragmentInfo>,
 }
 
-// ===== Sidx =====
-
-pub struct SidxReference {
-    pub referenced_size: u32,
-    pub subsegment_duration: u32,
-    pub starts_with_sap: bool,
-    pub sap_type: u8,
+/// Per-track sample table data collected from all chunks (for Hybrid MP4 moov)
+pub struct TrackSampleTable {
+    /// Total media duration in track timescale
+    pub total_duration: u64,
+    /// Size of each sample in bytes
+    pub sample_sizes: Vec<u32>,
+    /// Duration of each sample in track timescale
+    pub sample_durations: Vec<u32>,
+    /// Whether any sample has composition time offsets
+    pub has_cts: bool,
+    /// CTS version (0=unsigned, 1=signed)
+    pub cts_version: u8,
+    /// Composition time offset for each sample (empty if !has_cts)
+    pub cts_offsets: Vec<i32>,
+    /// 1-based sample indices of sync (key) samples
+    pub sync_samples: Vec<u32>,
+    /// Number of samples in each stbl "chunk" (one per fragment)
+    pub samples_per_chunk: Vec<u32>,
+    /// Absolute file offset of first sample in each stbl "chunk"
+    pub chunk_offsets: Vec<u64>,
 }
 
 // ===== JSON Types =====
