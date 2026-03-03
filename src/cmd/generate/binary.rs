@@ -23,3 +23,11 @@ pub fn write_u64_be(buf: &mut Vec<u8>, v: u64) {
 pub fn write_i32_be(buf: &mut Vec<u8>, v: i32) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
+
+pub fn write_i64_be(buf: &mut Vec<u8>, v: i64) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+
+pub fn write_u16_be(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}

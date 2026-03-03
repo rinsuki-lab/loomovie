@@ -20,8 +20,8 @@ pub struct TfhdInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TfdtInfo {
+    #[allow(dead_code)]
     pub version: u8,
     pub base_media_decode_time: u64,
 }
@@ -80,7 +80,6 @@ pub struct FragmentInfo {
     /// Parsed tfhd
     pub tfhd: TfhdInfo,
     /// Parsed tfdt
-    #[allow(dead_code)]
     pub tfdt: Option<TfdtInfo>,
     /// Parsed trun
     pub trun: TrunInfo,
@@ -97,6 +96,9 @@ pub struct ChunkParseResult {
 
 /// Per-track sample table data collected from all chunks (for Hybrid MP4 moov)
 pub struct TrackSampleTable {
+    /// base_media_decode_time of first fragment (from tfdt), in track timescale.
+    /// Non-zero when media doesn't start at time 0 (e.g. audio with initial offset).
+    pub media_start_time: u64,
     /// Total media duration in track timescale
     pub total_duration: u64,
     /// Size of each sample in bytes

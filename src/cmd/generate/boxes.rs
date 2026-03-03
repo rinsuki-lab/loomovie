@@ -200,24 +200,104 @@ fn patch_mdhd_duration(mdhd: &mut [u8], duration: u64) {
     }
 }
 
+/// Generate an edts box with an elst entry for initial media time offset.
+///
+/// This creates an edit list that maps:
+///   - An empty edit of `empty_duration` (in movie timescale) at the start
+///   - A media edit covering the rest, starting at `media_time` (in media timescale)
+///
+/// If media_start_time is 0, returns None (no edit list needed).
+fn generate_edts(
+    media_start_time: u64,
+    media_duration: u64,
+    track_timescale: u32,
+    movie_timescale: u32,
+) -> Option<Vec<u8>> {
+    if media_start_time == 0 {
+        return None;
+    }
+
+    // Convert media_start_time from track timescale to movie timescale for the empty edit
+    let empty_duration_movie =
+        media_start_time * movie_timescale as u64 / track_timescale as u64;
+
+    // The media edit segment duration (in movie timescale)
+    let media_segment_duration_movie =
+        media_duration * movie_timescale as u64 / track_timescale as u64;
+
+    // Use version 1 (64-bit) if any value overflows u32
+    let use_v1 = empty_duration_movie > u32::MAX as u64
+        || media_segment_duration_movie > u32::MAX as u64
+        || media_start_time > u32::MAX as u64;
+
+    let mut elst_data = Vec::new();
+    if media_start_time > 0 {
+        // Two entries: empty edit + media edit
+        write_u32_be(&mut elst_data, 2);
+    } else {
+        write_u32_be(&mut elst_data, 1);
+    }
+
+    if media_start_time > 0 {
+        // Entry 1: empty edit (segment_duration, media_time=-1)
+        if use_v1 {
+            write_u64_be(&mut elst_data, empty_duration_movie);
+            write_i64_be(&mut elst_data, -1); // media_time = -1 means empty
+        } else {
+            write_u32_be(&mut elst_data, empty_duration_movie as u32);
+            write_i32_be(&mut elst_data, -1);
+        }
+        write_u16_be(&mut elst_data, 1); // media_rate_integer
+        write_u16_be(&mut elst_data, 0); // media_rate_fraction
+    }
+
+    // Entry 2: media edit (play all media from time 0)
+    if use_v1 {
+        write_u64_be(&mut elst_data, media_segment_duration_movie);
+        write_i64_be(&mut elst_data, 0); // media_time = 0 (media starts at sample 0)
+    } else {
+        write_u32_be(&mut elst_data, media_segment_duration_movie as u32);
+        write_i32_be(&mut elst_data, 0);
+    }
+    write_u16_be(&mut elst_data, 1); // media_rate_integer
+    write_u16_be(&mut elst_data, 0); // media_rate_fraction
+
+    let elst = make_fullbox(b"elst", if use_v1 { 1 } else { 0 }, 0, &elst_data);
+    Some(make_box(b"edts", &elst))
+}
+
 /// Build a complete trak box for Hybrid MP4 output.
 pub fn generate_hybrid_trak(
     track: &TrackInfo,
     st: &TrackSampleTable,
     movie_timescale: u32,
 ) -> Vec<u8> {
-    // Patch tkhd: set duration in movie timescale
+    // Patch tkhd: set duration in movie timescale (includes initial empty edit)
     let mut tkhd = track.tkhd_raw.clone();
-    let tkhd_duration = if track.timescale == movie_timescale {
+    let media_duration_movie = if track.timescale == movie_timescale {
         st.total_duration
     } else {
         st.total_duration * movie_timescale as u64 / track.timescale as u64
     };
+    let empty_duration_movie = if st.media_start_time > 0 {
+        st.media_start_time * movie_timescale as u64 / track.timescale as u64
+    } else {
+        0
+    };
+    let tkhd_duration = empty_duration_movie + media_duration_movie;
     patch_tkhd_duration(&mut tkhd, tkhd_duration);
 
     // Patch mdhd: set duration in track timescale
     let mut mdhd = track.mdhd_raw.clone();
     patch_mdhd_duration(&mut mdhd, st.total_duration);
+
+    // Generate edts/elst if there's an initial media offset
+    let edts = generate_edts(
+        st.media_start_time,
+        st.total_duration,
+        track.timescale,
+        movie_timescale,
+    );
 
     // Build stbl
     let stbl = generate_stbl(&track.stsd_raw, st);
@@ -236,9 +316,12 @@ pub fn generate_hybrid_trak(
     mdia_content.extend_from_slice(&minf);
     let mdia = make_box(b"mdia", &mdia_content);
 
-    // trak = tkhd + mdia
+    // trak = tkhd + [edts] + mdia
     let mut trak_content = Vec::new();
     trak_content.extend_from_slice(&tkhd);
+    if let Some(ref edts_box) = edts {
+        trak_content.extend_from_slice(edts_box);
+    }
     trak_content.extend_from_slice(&mdia);
     make_box(b"trak", &trak_content)
 }
@@ -253,16 +336,22 @@ pub fn generate_hybrid_moov(
     let movie_timescale = tracks[0].timescale;
     let max_track_id = tracks.iter().map(|t| t.new_track_id).max().unwrap_or(0);
 
-    // Movie duration = max across tracks (converted to movie timescale)
+    // Movie duration = max across tracks (converted to movie timescale, including initial offset)
     let movie_duration = tracks
         .iter()
         .zip(sample_tables.iter())
         .map(|(t, st)| {
-            if t.timescale == movie_timescale {
+            let media_dur = if t.timescale == movie_timescale {
                 st.total_duration
             } else {
                 st.total_duration * movie_timescale as u64 / t.timescale as u64
-            }
+            };
+            let empty_dur = if st.media_start_time > 0 {
+                st.media_start_time * movie_timescale as u64 / t.timescale as u64
+            } else {
+                0
+            };
+            empty_dur + media_dur
         })
         .max()
         .unwrap_or(0);

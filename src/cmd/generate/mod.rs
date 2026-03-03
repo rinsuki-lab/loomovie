@@ -171,6 +171,7 @@ pub fn run(json_path_str: &str, prefix: &str) {
     for stream_idx in 0..num_streams {
         let track = &tracks[stream_idx];
         let mut st = TrackSampleTable {
+            media_start_time: 0,
             total_duration: 0,
             sample_sizes: Vec::new(),
             sample_durations: Vec::new(),
@@ -183,10 +184,18 @@ pub fn run(json_path_str: &str, prefix: &str) {
         };
 
         let mut sample_number: u32 = 0;
+        let mut is_first_fragment = true;
 
         for chunk_idx in 0..num_chunks {
             let (_, ref parsed) = parsed_chunks[stream_idx][chunk_idx];
             for frag in &parsed.fragments {
+                // Record base_media_decode_time from the very first fragment
+                if is_first_fragment {
+                    if let Some(ref tfdt) = frag.tfdt {
+                        st.media_start_time = tfdt.base_media_decode_time;
+                    }
+                    is_first_fragment = false;
+                }
                 let frag_sample_count = frag.trun.sample_count;
                 st.samples_per_chunk.push(frag_sample_count);
                 st.chunk_offsets.push(0); // placeholder — filled in after moov size is known
