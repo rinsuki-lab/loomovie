@@ -1,4 +1,5 @@
 mod cmd;
+mod proto;
 
 use clap::{Parser, Subcommand};
 

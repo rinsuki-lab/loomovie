@@ -1,0 +1,33 @@
+syntax = "proto2";
+
+package recipe;
+
+message RecipeFile {
+    oneof recipe {
+        RecipeV1 v1 = 1;
+    }
+}
+
+message RecipeV1 {
+    // offset 順で並んでいる必要がある。
+    // offset=0から始まり、次のエントリのoffsetは前のエントリのoffset+sizeと一致する必要がある。
+    repeated Chunk chunks = 1;
+}
+
+message Chunk {
+    // content は最初から最後まで全てのデータがそのまま使われる
+    oneof content {
+        // ファイルパス
+        string file = 1;
+        // データそのまま
+        bytes data = 2;
+    }
+
+    // この offset と size は生成するファイル内でのオフセットとサイズを示す (contentの中から切り出してくるという話ではない)
+    required uint64 offset = 3;
+    // size は content のサイズと一致必須
+    required uint64 size = 4;
+
+    // content の crc32
+    required uint32 crc32 = 5;
+}
