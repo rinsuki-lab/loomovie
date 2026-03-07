@@ -12,12 +12,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Merge fragmented MP4 streams into a single file
-    Generate {
+    /// Generate a recipe.pb describing how to assemble a Hybrid MP4 from fragmented streams
+    Plan {
         /// Path to streams.json input file
         streams_json: String,
-        /// Output prefix (e.g., "output/out" produces output/out.init.m4s, etc.)
-        prefix: String,
+        /// Output path for the recipe file (e.g., "output/recipe.pb")
+        recipe_pb: String,
+    },
+    /// Output binary data from a recipe.pb for a given byte range
+    Bin {
+        /// Path to the recipe.pb file
+        recipe_pb: String,
+        /// Start byte offset (inclusive), defaults to 0
+        start: Option<u64>,
+        /// End byte offset (exclusive), defaults to end of file
+        end: Option<u64>,
     },
     /// Validate a generated MP4 against its sources.json
     Validate {
@@ -39,11 +48,18 @@ fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Generate {
+        Commands::Plan {
             streams_json,
-            prefix,
+            recipe_pb,
         } => {
-            cmd::generate::run(&streams_json, &prefix);
+            cmd::plan::run(&streams_json, &recipe_pb);
+        }
+        Commands::Bin {
+            recipe_pb,
+            start,
+            end,
+        } => {
+            cmd::bin::run(&recipe_pb, start, end);
         }
         Commands::Validate { sources_json, mp4 } => {
             cmd::validate::run(&sources_json, &mp4);

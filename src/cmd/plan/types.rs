@@ -1,6 +1,6 @@
 // Data types used throughout the application
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // ===== Parsed MP4 Structures =====
 
@@ -134,23 +134,4 @@ pub struct StreamConfig {
 #[derive(Deserialize)]
 pub struct InputConfig {
     pub streams: Vec<StreamConfig>,
-}
-
-#[derive(Serialize)]
-pub struct SourceDest {
-    pub r#type: String,
-    pub offset: u64,
-    pub length: u64,
-}
-
-#[derive(Serialize)]
-pub struct SourceFile {
-    pub source: String,
-    pub sha256: String,
-    pub dest: SourceDest,
-}
-
-#[derive(Serialize)]
-pub struct SourcesOutput {
-    pub files: Vec<SourceFile>,
 }

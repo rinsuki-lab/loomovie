@@ -1,6 +1,6 @@
-// Generate subcommand: merge fragmented MP4 streams into a Hybrid MP4
+// Plan subcommand: generate a recipe.pb describing how to assemble a Hybrid MP4
 //
-// Layout (init + data concatenated):
+// Layout of the described MP4 (init + data concatenated):
 //   [ftyp]
 //   [free: lmc1 + original_init_0]
 //   [free: lmc1 + original_init_1]
@@ -20,16 +20,44 @@ mod parse;
 mod types;
 
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use prost::Message;
 use tracing::{debug, info};
 
 use self::boxes::*;
 use self::mp4_box::make_free_header;
 use self::parse::*;
 use self::types::*;
+
+use crate::proto;
+
+/// Compute a relative path from `base` to `target`.
+/// Both paths should be absolute (canonicalized) for reliable results.
+fn relative_path(base: &Path, target: &Path) -> PathBuf {
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+
+    // Find common prefix length
+    let common_len = base_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    // Go up from base to common ancestor
+    for _ in common_len..base_components.len() {
+        result.push("..");
+    }
+    // Go down from common ancestor to target
+    for component in &target_components[common_len..] {
+        if let Component::Normal(c) = component {
+            result.push(c);
+        }
+    }
+    result
+}
 
 /// Size of the lmc1 header placed before each embedded source file
 const LMC1_HEADER_SIZE: usize = 16;
@@ -51,15 +79,42 @@ fn make_lmc1_header(stream_index: u8, file_index: u32, data: &[u8]) -> [u8; LMC1
     header
 }
 
-fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
+/// Create a recipe Chunk with inline data content
+fn make_data_chunk(offset: u64, data: Vec<u8>) -> proto::Chunk {
+    let crc32 = crc32fast::hash(&data);
+    let size = data.len() as u64;
+    proto::Chunk {
+        offset,
+        size,
+        crc32,
+        content: Some(proto::chunk::Content::Data(data)),
+    }
 }
 
-pub fn run(json_path_str: &str, prefix: &str) {
+/// Create a recipe Chunk referencing a file
+fn make_file_chunk(offset: u64, file_path: String, file_data: &[u8]) -> proto::Chunk {
+    let crc32 = crc32fast::hash(file_data);
+    let size = file_data.len() as u64;
+    proto::Chunk {
+        offset,
+        size,
+        crc32,
+        content: Some(proto::chunk::Content::File(file_path)),
+    }
+}
+
+pub fn run(json_path_str: &str, recipe_path_str: &str) {
     let json_path = PathBuf::from(json_path_str);
     let json_base_dir = json_path.parent().unwrap_or(&PathBuf::from(".")).to_owned();
+
+    let recipe_path = fs::canonicalize(PathBuf::from(recipe_path_str).parent().unwrap_or(Path::new(".")))
+        .unwrap_or_else(|_| PathBuf::from(recipe_path_str).parent().unwrap_or(Path::new(".")).to_owned());
+    let recipe_base_dir = recipe_path.clone();
+    let recipe_out_path = recipe_base_dir.join(
+        PathBuf::from(recipe_path_str)
+            .file_name()
+            .expect("recipe path must have a filename"),
+    );
 
     let json_str = fs::read_to_string(&json_path).expect("Failed to read streams.json");
     let config: InputConfig = serde_json::from_str(&json_str).expect("Failed to parse JSON");
@@ -102,10 +157,10 @@ pub fn run(json_path_str: &str, prefix: &str) {
     }
 
     // ===== Phase 2: Parse all chunks =====
-    // parsed_chunks[stream_idx][chunk_idx] = (relative_source_path, ChunkParseResult)
-    let mut parsed_chunks: Vec<Vec<(String, ChunkParseResult)>> = Vec::new();
-    // chunk_file_paths[stream_idx][chunk_idx] = absolute path to chunk file
-    let mut chunk_file_paths: Vec<Vec<PathBuf>> = Vec::new();
+    // parsed_chunks[stream_idx][chunk_idx] = ChunkParseResult
+    let mut parsed_chunks: Vec<Vec<ChunkParseResult>> = Vec::new();
+    // chunk_file_rel_paths[stream_idx][chunk_idx] = path relative to json_base_dir
+    let mut chunk_file_rel_paths: Vec<Vec<String>> = Vec::new();
 
     for (stream_idx, stream) in config.streams.iter().enumerate() {
         let init_parent = PathBuf::from(&stream.init)
@@ -114,38 +169,29 @@ pub fn run(json_path_str: &str, prefix: &str) {
             .unwrap_or_default();
 
         let mut stream_parsed = Vec::new();
-        let mut stream_paths = Vec::new();
+        let mut stream_rel_paths = Vec::new();
         for chunk_name in &stream.chunks {
             let chunk_path = json_base_dir.join(&init_parent).join(chunk_name);
             let chunk_data = fs::read(&chunk_path)
                 .unwrap_or_else(|e| panic!("Failed to read chunk {}: {}", chunk_path.display(), e));
             let parsed = parse_chunk(&chunk_data);
             let relative_source = init_parent.join(chunk_name).to_string_lossy().to_string();
-            stream_parsed.push((relative_source, parsed));
-            stream_paths.push(chunk_path);
+            stream_parsed.push(parsed);
+            stream_rel_paths.push(relative_source);
         }
         parsed_chunks.push(stream_parsed);
-        chunk_file_paths.push(stream_paths);
+        chunk_file_rel_paths.push(stream_rel_paths);
         info!(stream_idx, num_chunks, "parsed chunks for stream");
     }
 
     // ===== Phase 3: Collect sample tables & data layout =====
-    //
-    // Each fragment within an original chunk file becomes one "chunk" in the
-    // stbl sense (a contiguous run of samples).  The chunk offset (co64) will
-    // point to the first sample byte inside the original file which is embedded
-    // verbatim in the mdat.
-    //
-    // Data layout inside mdat (per chunk_idx, per stream_idx):
-    //   [lmc1_header (16 bytes)][original_chunk_file_bytes]
 
-    // First, compute the size of each chunk-file entry in the mdat.
     // chunk_data_sizes[chunk_idx][stream_idx] = LMC1_HEADER_SIZE + file_size
     let mut chunk_data_sizes: Vec<Vec<usize>> = Vec::new();
     for chunk_idx in 0..num_chunks {
         let mut sizes = Vec::new();
         for stream_idx in 0..num_streams {
-            let (_, ref parsed) = parsed_chunks[stream_idx][chunk_idx];
+            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
             sizes.push(LMC1_HEADER_SIZE + parsed.file_size);
         }
         chunk_data_sizes.push(sizes);
@@ -187,7 +233,7 @@ pub fn run(json_path_str: &str, prefix: &str) {
         let mut is_first_fragment = true;
 
         for chunk_idx in 0..num_chunks {
-            let (_, ref parsed) = parsed_chunks[stream_idx][chunk_idx];
+            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
             for frag in &parsed.fragments {
                 // Record base_media_decode_time from the very first fragment
                 if is_first_fragment {
@@ -277,39 +323,47 @@ pub fn run(json_path_str: &str, prefix: &str) {
         sample_tables.push(st);
     }
 
-    // ===== Phase 4: Build init file =====
+    // ===== Phase 4: Build recipe chunks =====
 
+    let mut recipe_chunks: Vec<proto::Chunk> = Vec::new();
+    let mut current_offset: u64 = 0;
+
+    // --- ftyp ---
     let ftyp = generate_ftyp();
-    let mut sources: Vec<SourceFile> = Vec::new();
+    recipe_chunks.push(make_data_chunk(current_offset, ftyp.clone()));
+    current_offset += ftyp.len() as u64;
 
-    // Embed original init files in free boxes with lmc1 headers
-    let mut free_boxes = Vec::new();
-    for (stream_idx, (source_name, init_data)) in init_file_data.iter().enumerate() {
+    // --- free boxes embedding original init files ---
+    for (stream_idx, (_source_name, init_data)) in init_file_data.iter().enumerate() {
         let lmc1 = make_lmc1_header(stream_idx as u8, 0x800000, init_data);
         let free_header = make_free_header(LMC1_HEADER_SIZE + init_data.len());
-        let box_start = ftyp.len() + free_boxes.len();
-        let original_data_offset = box_start + 8 + LMC1_HEADER_SIZE;
 
-        free_boxes.extend_from_slice(&free_header);
-        free_boxes.extend_from_slice(&lmc1);
-        free_boxes.extend_from_slice(init_data);
+        // free_header + lmc1 as inline data
+        let mut header_data = Vec::with_capacity(8 + LMC1_HEADER_SIZE);
+        header_data.extend_from_slice(&free_header);
+        header_data.extend_from_slice(&lmc1);
+        recipe_chunks.push(make_data_chunk(current_offset, header_data.clone()));
+        current_offset += header_data.len() as u64;
 
-        sources.push(SourceFile {
-            source: source_name.clone(),
-            sha256: compute_sha256(init_data),
-            dest: SourceDest {
-                r#type: "init".into(),
-                offset: original_data_offset as u64,
-                length: init_data.len() as u64,
-            },
-        });
+        // init file as file reference
+        let init_abs_path = fs::canonicalize(json_base_dir.join(_source_name))
+            .expect("Failed to canonicalize init path");
+        let init_rel_to_recipe = relative_path(&recipe_base_dir, &init_abs_path)
+            .to_string_lossy()
+            .to_string();
+        recipe_chunks.push(make_file_chunk(
+            current_offset,
+            init_rel_to_recipe,
+            init_data,
+        ));
+        current_offset += init_data.len() as u64;
     }
 
     // Generate moov with placeholder offsets to determine its size
     let moov_placeholder = generate_hybrid_moov(&tracks, &sample_tables);
     let moov_size = moov_placeholder.len();
 
-    let init_size = ftyp.len() + free_boxes.len() + moov_size;
+    let init_size = current_offset as usize + moov_size;
 
     // Now compute real chunk offsets
     // mdat content starts at init_size + mdat_header_size
@@ -320,7 +374,7 @@ pub fn run(json_path_str: &str, prefix: &str) {
 
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
-            let (_, ref parsed) = parsed_chunks[stream_idx][chunk_idx];
+            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
 
             // This chunk file's data starts at:
             let chunk_file_start = mdat_content_start + data_pos + LMC1_HEADER_SIZE as u64;
@@ -347,79 +401,55 @@ pub fn run(json_path_str: &str, prefix: &str) {
         "moov size changed after filling offsets"
     );
 
-    // Write init file
-    let prefix_path = PathBuf::from(prefix);
-    if let Some(parent) = prefix_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).expect("Failed to create output directory");
-        }
-    }
+    // --- moov ---
+    recipe_chunks.push(make_data_chunk(current_offset, moov));
+    current_offset += moov_size as u64;
 
-    let init_path = PathBuf::from(format!("{}.init.m4s", prefix));
-    let mut init_out = Vec::with_capacity(init_size);
-    init_out.extend_from_slice(&ftyp);
-    init_out.extend_from_slice(&free_boxes);
-    init_out.extend_from_slice(&moov);
-    assert_eq!(init_out.len(), init_size);
-
-    fs::write(&init_path, &init_out).expect("Failed to write init segment");
-    info!(
-        path = %init_path.display(),
-        size = init_out.len(),
-        "wrote init segment"
-    );
-
-    // ===== Phase 5: Write data (mdat) file =====
-    let data_path = PathBuf::from(format!("{}.data.m4s", prefix));
-    let mut data_out = fs::File::create(&data_path).expect("Failed to create data segment");
-
-    // Write mdat box header
-    if mdat_header_size == 16 {
-        // Large box: size=1, then 64-bit extended size
-        data_out.write_all(&1u32.to_be_bytes()).unwrap();
-        data_out.write_all(b"mdat").unwrap();
+    // --- mdat header ---
+    let mdat_header = if mdat_header_size == 16 {
         let total_mdat_box_size = mdat_header_size + total_mdat_payload;
-        data_out
-            .write_all(&total_mdat_box_size.to_be_bytes())
-            .unwrap();
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&1u32.to_be_bytes()); // size=1 (use extended)
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&total_mdat_box_size.to_be_bytes());
+        buf
     } else {
         let total_mdat_box_size = (mdat_header_size + total_mdat_payload) as u32;
-        data_out
-            .write_all(&total_mdat_box_size.to_be_bytes())
-            .unwrap();
-        data_out.write_all(b"mdat").unwrap();
-    }
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(&total_mdat_box_size.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf
+    };
+    recipe_chunks.push(make_data_chunk(current_offset, mdat_header.clone()));
+    current_offset += mdat_header.len() as u64;
 
-    let mut data_written: u64 = 0;
-
+    // --- mdat content: lmc1 headers + chunk files ---
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
-            let (ref source_name, ref parsed) = parsed_chunks[stream_idx][chunk_idx];
+            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let chunk_rel = &chunk_file_rel_paths[stream_idx][chunk_idx];
 
-            // Read full chunk file
-            let chunk_path = &chunk_file_paths[stream_idx][chunk_idx];
-            let chunk_data = fs::read(chunk_path).unwrap();
+            // Read chunk file to compute lmc1 header
+            let chunk_abs_path = json_base_dir.join(chunk_rel);
+            let chunk_data = fs::read(&chunk_abs_path).unwrap();
 
-            // Write lmc1 header
+            // lmc1 header as inline data
             let lmc1 = make_lmc1_header(stream_idx as u8, chunk_idx as u32, &chunk_data);
-            data_out.write_all(&lmc1).unwrap();
+            recipe_chunks.push(make_data_chunk(current_offset, lmc1.to_vec()));
+            current_offset += LMC1_HEADER_SIZE as u64;
 
-            // Record source location (absolute offset in combined file)
-            let orig_start = init_size as u64 + mdat_header_size + data_written + LMC1_HEADER_SIZE as u64;
-            sources.push(SourceFile {
-                source: source_name.clone(),
-                sha256: compute_sha256(&chunk_data),
-                dest: SourceDest {
-                    r#type: "data".into(),
-                    offset: orig_start,
-                    length: chunk_data.len() as u64,
-                },
-            });
-
-            // Write original chunk file verbatim
-            data_out.write_all(&chunk_data).unwrap();
-
-            data_written += (LMC1_HEADER_SIZE + parsed.file_size) as u64;
+            // chunk file as file reference
+            let chunk_abs_canon = fs::canonicalize(&chunk_abs_path)
+                .expect("Failed to canonicalize chunk path");
+            let chunk_rel_to_recipe = relative_path(&recipe_base_dir, &chunk_abs_canon)
+                .to_string_lossy()
+                .to_string();
+            recipe_chunks.push(make_file_chunk(
+                current_offset,
+                chunk_rel_to_recipe,
+                &chunk_data,
+            ));
+            current_offset += parsed.file_size as u64;
         }
 
         if chunk_idx % 100 == 0 && chunk_idx > 0 {
@@ -427,22 +457,29 @@ pub fn run(json_path_str: &str, prefix: &str) {
         }
     }
 
-    data_out.flush().unwrap();
-    info!(
-        path = %data_path.display(),
-        size = mdat_header_size + data_written,
-        "wrote data segment"
-    );
+    // ===== Phase 5: Write recipe.pb =====
+    let recipe_file = proto::RecipeFile {
+        recipe: Some(proto::recipe_file::Recipe::V1(proto::RecipeV1 {
+            chunks: recipe_chunks,
+        })),
+    };
 
-    // ===== Phase 6: Write sources.json =====
-    let sources_output = SourcesOutput { files: sources };
-    let sources_json = serde_json::to_string_pretty(&sources_output).unwrap();
-    let sources_path = PathBuf::from(format!("{}.sources.json", prefix));
-    fs::write(&sources_path, &sources_json).expect("Failed to write sources.json");
-    info!(path = %sources_path.display(), "wrote sources");
+    let recipe_bytes = recipe_file.encode_to_vec();
 
+    if let Some(parent) = recipe_out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).expect("Failed to create output directory");
+        }
+    }
+
+    fs::write(&recipe_out_path, &recipe_bytes).expect("Failed to write recipe.pb");
     info!(
-        "done! to test: cat {}.init.m4s {}.data.m4s > {}.mp4 && ffplay {}.mp4",
-        prefix, prefix, prefix, prefix
+        path = %recipe_out_path.display(),
+        size = recipe_bytes.len(),
+        total_output_size = current_offset,
+        num_chunks = recipe_file.recipe.as_ref().map(|r| match r {
+            proto::recipe_file::Recipe::V1(v1) => v1.chunks.len(),
+        }).unwrap_or(0),
+        "wrote recipe"
     );
 }
