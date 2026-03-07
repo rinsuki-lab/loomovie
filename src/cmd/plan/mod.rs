@@ -2,16 +2,21 @@
 //
 // Layout of the described MP4 (init + data concatenated):
 //   [ftyp]
-//   [free: lmc1 + original_init_0]
-//   [free: lmc1 + original_init_1]
+//   [free: zip_local_header + original_init_0]
+//   [free: zip_local_header + original_init_1]
 //   [moov with full stbl (co64 pointing into mdat)]
 //   [mdat]
 //     for each chunk_idx, stream_idx:
-//       [lmc1_header(16)][original_chunk_file_bytes]
+//       [zip_local_header][original_chunk_file_bytes]
+//   [free: zip central directory + zip64 eocd + zip64 locator + eocd]
 //
 // The moov's sample tables reference actual sample data positions inside
 // the original chunk files, skipping over fMP4 structural boxes (moof, mdat
 // headers etc.) that are embedded verbatim.
+//
+// The file is also a valid ZIP archive, with each embedded source file
+// stored as a ZIP entry (compression method 0 = stored). Entry names use
+// the pattern: streams.N/init.mp4 and streams.N/chunks/chunk.NNNNNNNN.m4s
 
 mod binary;
 mod boxes;
@@ -59,24 +64,124 @@ fn relative_path(base: &Path, target: &Path) -> PathBuf {
     result
 }
 
-/// Size of the lmc1 header placed before each embedded source file
-const LMC1_HEADER_SIZE: usize = 16;
+// ===== ZIP helpers =====
 
-fn make_lmc1_header(stream_index: u8, file_index: u32, data: &[u8]) -> [u8; LMC1_HEADER_SIZE] {
-    let crc = crc32fast::hash(data);
-    let size = data.len() as u32;
-    let mut header = [0u8; LMC1_HEADER_SIZE];
-    header[0..4].copy_from_slice(b"lmc1");
-    header[4] = stream_index;
-    // file_index: 24-bit big-endian in bytes 5-7 (MSB set for init segments)
-    header[5] = ((file_index >> 16) & 0xFF) as u8;
-    header[6] = ((file_index >> 8) & 0xFF) as u8;
-    header[7] = (file_index & 0xFF) as u8;
-    // CRC-32 big-endian
-    header[8..12].copy_from_slice(&crc.to_be_bytes());
-    // Size big-endian
-    header[12..16].copy_from_slice(&size.to_be_bytes());
-    header
+/// Information about a ZIP file entry, collected for central directory generation
+struct ZipFileEntry {
+    filename: Vec<u8>,
+    crc32: u32,
+    file_size: u64,
+    local_header_offset: u64,
+}
+
+fn zip_entry_name_init(stream_idx: usize) -> String {
+    format!("streams.{}/init.mp4", stream_idx)
+}
+
+fn zip_entry_name_chunk(stream_idx: usize, chunk_idx: usize) -> String {
+    format!("streams.{}/chunks/chunk.{:06}.m4s", stream_idx, chunk_idx)
+}
+
+/// Size of a ZIP local file header with ZIP64 extra field
+fn zip_local_file_header_size(filename_len: usize) -> usize {
+    30 + filename_len + 20 // 20 = ZIP64 extra field (4 byte header + 16 byte data)
+}
+
+/// Generate a ZIP local file header for a stored (uncompressed) file with ZIP64 extensions
+fn make_zip_local_file_header(filename: &[u8], crc32: u32, file_size: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(zip_local_file_header_size(filename.len()));
+    buf.extend_from_slice(&0x04034b50u32.to_le_bytes()); // signature
+    buf.extend_from_slice(&45u16.to_le_bytes()); // version needed (4.5 for ZIP64)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
+    buf.extend_from_slice(&0u16.to_le_bytes()); // compression method (stored)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
+    buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
+    buf.extend_from_slice(&crc32.to_le_bytes()); // crc-32
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // compressed size (ZIP64)
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // uncompressed size (ZIP64)
+    buf.extend_from_slice(&(filename.len() as u16).to_le_bytes()); // file name length
+    buf.extend_from_slice(&20u16.to_le_bytes()); // extra field length
+    buf.extend_from_slice(filename); // file name
+    // ZIP64 extended information extra field
+    buf.extend_from_slice(&0x0001u16.to_le_bytes()); // header id
+    buf.extend_from_slice(&16u16.to_le_bytes()); // data size
+    buf.extend_from_slice(&file_size.to_le_bytes()); // original uncompressed size
+    buf.extend_from_slice(&file_size.to_le_bytes()); // compressed size (same for stored)
+    buf
+}
+
+/// Generate a ZIP central directory file header entry
+fn make_zip_cd_entry(entry: &ZipFileEntry) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(46 + entry.filename.len() + 28);
+    buf.extend_from_slice(&0x02014b50u32.to_le_bytes()); // signature
+    buf.extend_from_slice(&((3u16 << 8) | 45).to_le_bytes()); // version made by (UNIX, 4.5)
+    buf.extend_from_slice(&45u16.to_le_bytes()); // version needed
+    buf.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
+    buf.extend_from_slice(&0u16.to_le_bytes()); // compression method (stored)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
+    buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
+    buf.extend_from_slice(&entry.crc32.to_le_bytes()); // crc-32
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // compressed size (ZIP64)
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // uncompressed size (ZIP64)
+    buf.extend_from_slice(&(entry.filename.len() as u16).to_le_bytes()); // file name length
+    buf.extend_from_slice(&28u16.to_le_bytes()); // extra field length (ZIP64 with offset)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // file comment length
+    buf.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+    buf.extend_from_slice(&0u16.to_le_bytes()); // internal file attributes
+    buf.extend_from_slice(&0u32.to_le_bytes()); // external file attributes
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // relative offset (ZIP64)
+    buf.extend_from_slice(&entry.filename); // file name
+    // ZIP64 extended information extra field
+    buf.extend_from_slice(&0x0001u16.to_le_bytes()); // header id
+    buf.extend_from_slice(&24u16.to_le_bytes()); // data size (8+8+8)
+    buf.extend_from_slice(&entry.file_size.to_le_bytes()); // original uncompressed size
+    buf.extend_from_slice(&entry.file_size.to_le_bytes()); // compressed size
+    buf.extend_from_slice(&entry.local_header_offset.to_le_bytes()); // offset of local header
+    buf
+}
+
+/// Generate ZIP end-of-archive records: central directory + ZIP64 EOCD + locator + EOCD
+fn make_zip_end_records(entries: &[ZipFileEntry], cd_offset: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Central directory entries
+    for entry in entries {
+        buf.extend_from_slice(&make_zip_cd_entry(entry));
+    }
+    let cd_size = buf.len() as u64;
+    let zip64_eocd_offset = cd_offset + cd_size;
+
+    // ZIP64 End of Central Directory Record
+    buf.extend_from_slice(&0x06064b50u32.to_le_bytes()); // signature
+    buf.extend_from_slice(&44u64.to_le_bytes()); // size of remaining record
+    buf.extend_from_slice(&((3u16 << 8) | 45).to_le_bytes()); // version made by
+    buf.extend_from_slice(&45u16.to_le_bytes()); // version needed
+    buf.extend_from_slice(&0u32.to_le_bytes()); // disk number
+    buf.extend_from_slice(&0u32.to_le_bytes()); // disk with CD start
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes()); // entries on this disk
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes()); // total entries
+    buf.extend_from_slice(&cd_size.to_le_bytes()); // size of central directory
+    buf.extend_from_slice(&cd_offset.to_le_bytes()); // offset of central directory
+
+    // ZIP64 End of Central Directory Locator
+    buf.extend_from_slice(&0x07064b50u32.to_le_bytes()); // signature
+    buf.extend_from_slice(&0u32.to_le_bytes()); // disk with ZIP64 EOCD
+    buf.extend_from_slice(&zip64_eocd_offset.to_le_bytes()); // offset of ZIP64 EOCD
+    buf.extend_from_slice(&1u32.to_le_bytes()); // total disks
+
+    // End of Central Directory Record
+    let entries_count = entries.len() as u64;
+    let entries_16 = if entries_count > u16::MAX as u64 { u16::MAX } else { entries_count as u16 };
+    let cd_size_32 = if cd_size > u32::MAX as u64 { u32::MAX } else { cd_size as u32 };
+    let cd_offset_32 = if cd_offset > u32::MAX as u64 { u32::MAX } else { cd_offset as u32 };
+    buf.extend_from_slice(&0x06054b50u32.to_le_bytes()); // signature
+    buf.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    buf.extend_from_slice(&0u16.to_le_bytes()); // disk with CD start
+    buf.extend_from_slice(&entries_16.to_le_bytes()); // entries on this disk
+    buf.extend_from_slice(&entries_16.to_le_bytes()); // total entries
+    buf.extend_from_slice(&cd_size_32.to_le_bytes()); // size of central directory
+    buf.extend_from_slice(&cd_offset_32.to_le_bytes()); // offset of central directory
+    buf.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    buf
 }
 
 /// Create a recipe Chunk with inline data content
@@ -186,13 +291,14 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
     // ===== Phase 3: Collect sample tables & data layout =====
 
-    // chunk_data_sizes[chunk_idx][stream_idx] = LMC1_HEADER_SIZE + file_size
+    // chunk_data_sizes[chunk_idx][stream_idx] = zip_header_size + file_size
     let mut chunk_data_sizes: Vec<Vec<usize>> = Vec::new();
     for chunk_idx in 0..num_chunks {
         let mut sizes = Vec::new();
         for stream_idx in 0..num_streams {
             let ref parsed = parsed_chunks[stream_idx][chunk_idx];
-            sizes.push(LMC1_HEADER_SIZE + parsed.file_size);
+            let filename = zip_entry_name_chunk(stream_idx, chunk_idx);
+            sizes.push(zip_local_file_header_size(filename.len()) + parsed.file_size);
         }
         chunk_data_sizes.push(sizes);
     }
@@ -333,15 +439,27 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     recipe_chunks.push(make_data_chunk(current_offset, ftyp.clone()));
     current_offset += ftyp.len() as u64;
 
-    // --- free boxes embedding original init files ---
+    // --- free boxes embedding original init files with ZIP headers ---
+    let mut zip_file_entries: Vec<ZipFileEntry> = Vec::new();
     for (stream_idx, (_source_name, init_data)) in init_file_data.iter().enumerate() {
-        let lmc1 = make_lmc1_header(stream_idx as u8, 0x800000, init_data);
-        let free_header = make_free_header(LMC1_HEADER_SIZE + init_data.len());
+        let filename = zip_entry_name_init(stream_idx);
+        let crc = crc32fast::hash(init_data);
+        let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, init_data.len() as u64);
+        let free_header = make_free_header(zip_header.len() + init_data.len());
 
-        // free_header + lmc1 as inline data
-        let mut header_data = Vec::with_capacity(8 + LMC1_HEADER_SIZE);
+        // ZIP local header offset is after the free box header
+        let zip_local_header_offset = current_offset + 8;
+        zip_file_entries.push(ZipFileEntry {
+            filename: filename.into_bytes(),
+            crc32: crc,
+            file_size: init_data.len() as u64,
+            local_header_offset: zip_local_header_offset,
+        });
+
+        // free_header + zip_header as inline data
+        let mut header_data = Vec::with_capacity(8 + zip_header.len());
         header_data.extend_from_slice(&free_header);
-        header_data.extend_from_slice(&lmc1);
+        header_data.extend_from_slice(&zip_header);
         recipe_chunks.push(make_data_chunk(current_offset, header_data.clone()));
         current_offset += header_data.len() as u64;
 
@@ -375,9 +493,11 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
             let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let filename = zip_entry_name_chunk(stream_idx, chunk_idx);
+            let zip_hdr_size = zip_local_file_header_size(filename.len()) as u64;
 
             // This chunk file's data starts at:
-            let chunk_file_start = mdat_content_start + data_pos + LMC1_HEADER_SIZE as u64;
+            let chunk_file_start = mdat_content_start + data_pos + zip_hdr_size;
 
             // Each fragment within this chunk file becomes one stbl chunk
             for frag in &parsed.fragments {
@@ -389,7 +509,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                 chunk_offset_cursor[stream_idx] += 1;
             }
 
-            data_pos += (LMC1_HEADER_SIZE + parsed.file_size) as u64;
+            data_pos += zip_hdr_size + parsed.file_size as u64;
         }
     }
 
@@ -423,20 +543,31 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     recipe_chunks.push(make_data_chunk(current_offset, mdat_header.clone()));
     current_offset += mdat_header.len() as u64;
 
-    // --- mdat content: lmc1 headers + chunk files ---
+    // --- mdat content: zip local headers + chunk files ---
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
             let ref parsed = parsed_chunks[stream_idx][chunk_idx];
             let chunk_rel = &chunk_file_rel_paths[stream_idx][chunk_idx];
 
-            // Read chunk file to compute lmc1 header
             let chunk_abs_path = json_base_dir.join(chunk_rel);
             let chunk_data = fs::read(&chunk_abs_path).unwrap();
 
-            // lmc1 header as inline data
-            let lmc1 = make_lmc1_header(stream_idx as u8, chunk_idx as u32, &chunk_data);
-            recipe_chunks.push(make_data_chunk(current_offset, lmc1.to_vec()));
-            current_offset += LMC1_HEADER_SIZE as u64;
+            let filename = zip_entry_name_chunk(stream_idx, chunk_idx);
+            let crc = crc32fast::hash(&chunk_data);
+            let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, chunk_data.len() as u64);
+
+            // Record ZIP entry for central directory
+            zip_file_entries.push(ZipFileEntry {
+                filename: filename.into_bytes(),
+                crc32: crc,
+                file_size: chunk_data.len() as u64,
+                local_header_offset: current_offset,
+            });
+
+            // ZIP local header as inline data
+            let zip_header_len = zip_header.len() as u64;
+            recipe_chunks.push(make_data_chunk(current_offset, zip_header));
+            current_offset += zip_header_len;
 
             // chunk file as file reference
             let chunk_abs_canon = fs::canonicalize(&chunk_abs_path)
@@ -456,6 +587,16 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             debug!(chunk_idx, num_chunks, "progress");
         }
     }
+
+    // --- ZIP central directory and end records (wrapped in free box for MP4 compatibility) ---
+    let cd_offset = current_offset + 8; // 8 bytes for free box header
+    let zip_end_data = make_zip_end_records(&zip_file_entries, cd_offset);
+    let free_header = make_free_header(zip_end_data.len());
+    let mut zip_end_chunk = Vec::with_capacity(8 + zip_end_data.len());
+    zip_end_chunk.extend_from_slice(&free_header);
+    zip_end_chunk.extend_from_slice(&zip_end_data);
+    recipe_chunks.push(make_data_chunk(current_offset, zip_end_chunk.clone()));
+    current_offset += zip_end_chunk.len() as u64;
 
     // ===== Phase 5: Write recipe.pb =====
     let recipe_file = proto::RecipeFile {
