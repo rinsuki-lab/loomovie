@@ -2,21 +2,22 @@
 //
 // Layout of the described MP4 (init + data concatenated):
 //   [ftyp]
-//   [free: zip_local_header + original_init_0]
-//   [free: zip_local_header + original_init_1]
 //   [moov with full stbl (co64 pointing into mdat)]
 //   [mdat]
 //     for each chunk_idx, stream_idx:
 //       [zip_local_header][original_chunk_file_bytes]
+//   [free: deflated generated.m3u8 (master playlist)]
+//   [free: deflated streams.N/generated.m3u8 (per-stream playlists)]
+//   [free: streams.N/init.m4s]
 //   [free: zip central directory + zip64 eocd + zip64 locator + eocd]
 //
 // The moov's sample tables reference actual sample data positions inside
 // the original chunk files, skipping over fMP4 structural boxes (moof, mdat
 // headers etc.) that are embedded verbatim.
 //
-// The file is also a valid ZIP archive, with each embedded source file
-// stored as a ZIP entry (compression method 0 = stored). Entry names use
-// the pattern: streams.N/init.mp4 and streams.N/chunks/chunk.NNNNNNNN.m4s
+// The file is also a valid ZIP archive. Media/init files use method 0 (stored),
+// while m3u8 playlists use method 8 (deflated). Entry names use the pattern:
+// streams.N/init.m4s, streams.N/chunks/chunk.NNNNNN.m4s, and generated.m3u8.
 
 mod binary;
 mod boxes;
@@ -25,8 +26,11 @@ mod parse;
 mod types;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use prost::Message;
 use tracing::{debug, info};
 
@@ -70,12 +74,14 @@ fn relative_path(base: &Path, target: &Path) -> PathBuf {
 struct ZipFileEntry {
     filename: Vec<u8>,
     crc32: u32,
-    file_size: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    compression_method: u16,
     local_header_offset: u64,
 }
 
 fn zip_entry_name_init(stream_idx: usize) -> String {
-    format!("streams.{}/init.mp4", stream_idx)
+    format!("streams.{}/init.m4s", stream_idx)
 }
 
 fn zip_entry_name_chunk(stream_idx: usize, chunk_idx: usize) -> String {
@@ -87,13 +93,13 @@ fn zip_local_file_header_size(filename_len: usize) -> usize {
     30 + filename_len + 20 // 20 = ZIP64 extra field (4 byte header + 16 byte data)
 }
 
-/// Generate a ZIP local file header for a stored (uncompressed) file with ZIP64 extensions
-fn make_zip_local_file_header(filename: &[u8], crc32: u32, file_size: u64) -> Vec<u8> {
+/// Generate a ZIP local file header with ZIP64 extensions
+fn make_zip_local_file_header(filename: &[u8], crc32: u32, compression_method: u16, compressed_size: u64, uncompressed_size: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(zip_local_file_header_size(filename.len()));
     buf.extend_from_slice(&0x04034b50u32.to_le_bytes()); // signature
     buf.extend_from_slice(&45u16.to_le_bytes()); // version needed (4.5 for ZIP64)
     buf.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
-    buf.extend_from_slice(&0u16.to_le_bytes()); // compression method (stored)
+    buf.extend_from_slice(&compression_method.to_le_bytes()); // compression method
     buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
     buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
     buf.extend_from_slice(&crc32.to_le_bytes()); // crc-32
@@ -105,8 +111,8 @@ fn make_zip_local_file_header(filename: &[u8], crc32: u32, file_size: u64) -> Ve
     // ZIP64 extended information extra field
     buf.extend_from_slice(&0x0001u16.to_le_bytes()); // header id
     buf.extend_from_slice(&16u16.to_le_bytes()); // data size
-    buf.extend_from_slice(&file_size.to_le_bytes()); // original uncompressed size
-    buf.extend_from_slice(&file_size.to_le_bytes()); // compressed size (same for stored)
+    buf.extend_from_slice(&uncompressed_size.to_le_bytes()); // original uncompressed size
+    buf.extend_from_slice(&compressed_size.to_le_bytes()); // compressed size
     buf
 }
 
@@ -117,7 +123,7 @@ fn make_zip_cd_entry(entry: &ZipFileEntry) -> Vec<u8> {
     buf.extend_from_slice(&((3u16 << 8) | 45).to_le_bytes()); // version made by (UNIX, 4.5)
     buf.extend_from_slice(&45u16.to_le_bytes()); // version needed
     buf.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
-    buf.extend_from_slice(&0u16.to_le_bytes()); // compression method (stored)
+    buf.extend_from_slice(&entry.compression_method.to_le_bytes()); // compression method
     buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
     buf.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
     buf.extend_from_slice(&entry.crc32.to_le_bytes()); // crc-32
@@ -134,8 +140,8 @@ fn make_zip_cd_entry(entry: &ZipFileEntry) -> Vec<u8> {
     // ZIP64 extended information extra field
     buf.extend_from_slice(&0x0001u16.to_le_bytes()); // header id
     buf.extend_from_slice(&24u16.to_le_bytes()); // data size (8+8+8)
-    buf.extend_from_slice(&entry.file_size.to_le_bytes()); // original uncompressed size
-    buf.extend_from_slice(&entry.file_size.to_le_bytes()); // compressed size
+    buf.extend_from_slice(&entry.uncompressed_size.to_le_bytes()); // original uncompressed size
+    buf.extend_from_slice(&entry.compressed_size.to_le_bytes()); // compressed size
     buf.extend_from_slice(&entry.local_header_offset.to_le_bytes()); // offset of local header
     buf
 }
@@ -319,6 +325,8 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
     // Build per-track sample tables (with placeholder chunk_offsets for now)
     let mut sample_tables: Vec<TrackSampleTable> = Vec::new();
+    // chunk_durations_sec[stream_idx][chunk_idx] = duration in seconds (f64)
+    let mut chunk_durations_sec: Vec<Vec<f64>> = Vec::new();
 
     for stream_idx in 0..num_streams {
         let track = &tracks[stream_idx];
@@ -337,9 +345,11 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
         let mut sample_number: u32 = 0;
         let mut is_first_fragment = true;
+        let mut stream_chunk_durations: Vec<f64> = Vec::new();
 
         for chunk_idx in 0..num_chunks {
             let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let mut chunk_duration_ticks: u64 = 0;
             for frag in &parsed.fragments {
                 // Record base_media_decode_time from the very first fragment
                 if is_first_fragment {
@@ -363,6 +373,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                     });
                     st.sample_durations.push(duration);
                     st.total_duration += duration as u64;
+                    chunk_duration_ticks += duration as u64;
 
                     // Size: sample > tfhd default > trex default
                     let size = sample.size.unwrap_or_else(|| {
@@ -415,7 +426,9 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                     }
                 }
             }
+            stream_chunk_durations.push(chunk_duration_ticks as f64 / track.timescale as f64);
         }
+        chunk_durations_sec.push(stream_chunk_durations);
 
         info!(
             stream_idx,
@@ -439,43 +452,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     recipe_chunks.push(make_data_chunk(current_offset, ftyp.clone()));
     current_offset += ftyp.len() as u64;
 
-    // --- free boxes embedding original init files with ZIP headers ---
-    let mut zip_file_entries: Vec<ZipFileEntry> = Vec::new();
-    for (stream_idx, (_source_name, init_data)) in init_file_data.iter().enumerate() {
-        let filename = zip_entry_name_init(stream_idx);
-        let crc = crc32fast::hash(init_data);
-        let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, init_data.len() as u64);
-        let free_header = make_free_header(zip_header.len() + init_data.len());
-
-        // ZIP local header offset is after the free box header
-        let zip_local_header_offset = current_offset + 8;
-        zip_file_entries.push(ZipFileEntry {
-            filename: filename.into_bytes(),
-            crc32: crc,
-            file_size: init_data.len() as u64,
-            local_header_offset: zip_local_header_offset,
-        });
-
-        // free_header + zip_header as inline data
-        let mut header_data = Vec::with_capacity(8 + zip_header.len());
-        header_data.extend_from_slice(&free_header);
-        header_data.extend_from_slice(&zip_header);
-        recipe_chunks.push(make_data_chunk(current_offset, header_data.clone()));
-        current_offset += header_data.len() as u64;
-
-        // init file as file reference
-        let init_abs_path = fs::canonicalize(json_base_dir.join(_source_name))
-            .expect("Failed to canonicalize init path");
-        let init_rel_to_recipe = relative_path(&recipe_base_dir, &init_abs_path)
-            .to_string_lossy()
-            .to_string();
-        recipe_chunks.push(make_file_chunk(
-            current_offset,
-            init_rel_to_recipe,
-            init_data,
-        ));
-        current_offset += init_data.len() as u64;
-    }
+    // (init files are now placed after mdat, as ZIP-only entries)
 
     // Generate moov with placeholder offsets to determine its size
     let moov_placeholder = generate_hybrid_moov(&tracks, &sample_tables);
@@ -544,6 +521,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     current_offset += mdat_header.len() as u64;
 
     // --- mdat content: zip local headers + chunk files ---
+    let mut zip_file_entries: Vec<ZipFileEntry> = Vec::new();
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
             let ref parsed = parsed_chunks[stream_idx][chunk_idx];
@@ -554,13 +532,16 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
             let filename = zip_entry_name_chunk(stream_idx, chunk_idx);
             let crc = crc32fast::hash(&chunk_data);
-            let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, chunk_data.len() as u64);
+            let file_size = chunk_data.len() as u64;
+            let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, 0, file_size, file_size);
 
             // Record ZIP entry for central directory
             zip_file_entries.push(ZipFileEntry {
                 filename: filename.into_bytes(),
                 crc32: crc,
-                file_size: chunk_data.len() as u64,
+                compressed_size: file_size,
+                uncompressed_size: file_size,
+                compression_method: 0,
                 local_header_offset: current_offset,
             });
 
@@ -586,6 +567,213 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         if chunk_idx % 100 == 0 && chunk_idx > 0 {
             debug!(chunk_idx, num_chunks, "progress");
         }
+    }
+
+    // --- Trailing ZIP entries (wrapped in free boxes for MP4 compatibility) ---
+    // Order: generated.m3u8, streams.N/generated.m3u8, streams.N/init.m4s, then CD
+
+    // Helper: emit a small file as a free-box-wrapped ZIP entry with deflate compression
+    let emit_zip_entry_deflated = |recipe_chunks: &mut Vec<proto::Chunk>,
+                                        zip_file_entries: &mut Vec<ZipFileEntry>,
+                                        current_offset: &mut u64,
+                                        entry_name: &[u8],
+                                        data: &[u8]| {
+        let crc = crc32fast::hash(data);
+        let uncompressed_size = data.len() as u64;
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(data).expect("deflate write failed");
+        let compressed = encoder.finish().expect("deflate finish failed");
+        let compressed_size = compressed.len() as u64;
+        let zip_header = make_zip_local_file_header(entry_name, crc, 8, compressed_size, uncompressed_size);
+        let free_header = make_free_header(zip_header.len() + compressed.len());
+
+        let zip_local_header_offset = *current_offset + 8;
+        zip_file_entries.push(ZipFileEntry {
+            filename: entry_name.to_vec(),
+            crc32: crc,
+            compressed_size,
+            uncompressed_size,
+            compression_method: 8,
+            local_header_offset: zip_local_header_offset,
+        });
+
+        let mut chunk = Vec::with_capacity(8 + zip_header.len() + compressed.len());
+        chunk.extend_from_slice(&free_header);
+        chunk.extend_from_slice(&zip_header);
+        chunk.extend_from_slice(&compressed);
+        recipe_chunks.push(make_data_chunk(*current_offset, chunk.clone()));
+        *current_offset += chunk.len() as u64;
+    };
+
+    // Classify streams by type (video vs audio) using handler_type
+    let is_video: Vec<bool> = tracks.iter().map(|t| &t.handler_type == b"vide").collect();
+    let is_audio: Vec<bool> = tracks.iter().map(|t| &t.handler_type == b"soun").collect();
+
+    // Find audio-only stream index to pair with video-only streams
+    let audio_only_idx: Option<usize> = {
+        let audio_indices: Vec<usize> = (0..num_streams).filter(|&i| is_audio[i]).collect();
+        let video_indices: Vec<usize> = (0..num_streams).filter(|&i| is_video[i]).collect();
+        // Only create audio group if there are separate video-only and audio-only streams
+        if !video_indices.is_empty() && !audio_indices.is_empty() {
+            Some(audio_indices[0])
+        } else {
+            None
+        }
+    };
+
+    // Compute peak segment bit rate (BANDWIDTH) per stream
+    // RFC 8216: "the largest bit rate of any contiguous set of segments whose total
+    // duration is between 0.5 and 1.5 times the target duration"
+    let stream_bandwidths: Vec<u64> = (0..num_streams).map(|stream_idx| {
+        let durations = &chunk_durations_sec[stream_idx];
+        let target_dur = durations.iter().cloned().fold(0.0f64, f64::max).ceil();
+        let mut peak: f64 = 0.0;
+        for start in 0..durations.len() {
+            let mut total_size: u64 = 0;
+            let mut total_dur: f64 = 0.0;
+            for end in start..durations.len() {
+                total_size += parsed_chunks[stream_idx][end].file_size as u64;
+                total_dur += durations[end];
+                if total_dur >= 0.5 * target_dur {
+                    if total_dur > 1.5 * target_dur {
+                        break;
+                    }
+                    let bitrate = (total_size as f64 * 8.0) / total_dur;
+                    if bitrate > peak {
+                        peak = bitrate;
+                    }
+                }
+            }
+        }
+        peak.ceil() as u64
+    }).collect();
+
+    // 1) Generate master playlist (all.m3u8)
+    {
+        let mut m3u8 = String::new();
+        m3u8.push_str("#EXTM3U\n");
+        m3u8.push_str("#EXT-X-VERSION:6\n");
+        m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+
+        // If we have separate audio stream, declare it as a media group
+        if let Some(audio_idx) = audio_only_idx {
+            let group_name = format!("streams.{}", audio_idx);
+            m3u8.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT=YES,AUTOSELECT=YES,URI=\"streams.{}/generated.m3u8\"\n",
+                group_name, group_name, audio_idx,
+            ));
+        }
+
+        for stream_idx in 0..num_streams {
+            // Skip audio-only streams from STREAM-INF (they're referenced via AUDIO group)
+            if audio_only_idx == Some(stream_idx) {
+                continue;
+            }
+
+            let mut bandwidth = stream_bandwidths[stream_idx];
+            let mut codecs: Vec<String> = config.streams[stream_idx].codecs.clone();
+            if let Some(audio_idx) = audio_only_idx {
+                if is_video[stream_idx] {
+                    // BANDWIDTH must cover all playable renditions combined
+                    bandwidth += stream_bandwidths[audio_idx];
+                    // CODECS must include every format in all renditions
+                    codecs.extend(config.streams[audio_idx].codecs.iter().cloned());
+                    let group_name = format!("streams.{}", audio_idx);
+                    m3u8.push_str(&format!(
+                        "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\",AUDIO=\"{}\"\n",
+                        bandwidth, codecs.join(","), group_name,
+                    ));
+                } else {
+                    m3u8.push_str(&format!(
+                        "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"\n",
+                        bandwidth, codecs.join(","),
+                    ));
+                }
+            } else {
+                m3u8.push_str(&format!(
+                    "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"\n",
+                    bandwidth, codecs.join(","),
+                ));
+            }
+            m3u8.push_str(&format!("streams.{}/generated.m3u8\n", stream_idx));
+        }
+
+        let playlist_bytes = m3u8.into_bytes();
+        emit_zip_entry_deflated(
+            &mut recipe_chunks,
+            &mut zip_file_entries,
+            &mut current_offset,
+            b"generated.m3u8",
+            &playlist_bytes,
+        );
+    }
+
+    // 2) Generate per-stream media playlists (streams.N/playlist.m3u8)
+    for stream_idx in 0..num_streams {
+        let durations = &chunk_durations_sec[stream_idx];
+        let target_duration = durations.iter().cloned().fold(0.0f64, f64::max).ceil() as u64;
+
+        let mut m3u8 = String::new();
+        m3u8.push_str("#EXTM3U\n");
+        m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
+        m3u8.push_str("#EXT-X-VERSION:6\n");
+        m3u8.push_str("#EXT-X-MAP:URI=\"init.m4s\"\n");
+        m3u8.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+        m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        for (chunk_idx, dur) in durations.iter().enumerate() {
+            m3u8.push_str(&format!("#EXTINF:{:.6},\n", dur));
+            m3u8.push_str(&format!("chunks/chunk.{:06}.m4s\n", chunk_idx));
+        }
+        m3u8.push_str("#EXT-X-ENDLIST\n");
+
+        let playlist_name = format!("streams.{}/generated.m3u8", stream_idx);
+        let playlist_bytes = m3u8.into_bytes();
+        emit_zip_entry_deflated(
+            &mut recipe_chunks,
+            &mut zip_file_entries,
+            &mut current_offset,
+            playlist_name.as_bytes(),
+            &playlist_bytes,
+        );
+    }
+
+    // 3) Embed original init files as ZIP entries (streams.N/init.m4s)
+    for (stream_idx, (_source_name, init_data)) in init_file_data.iter().enumerate() {
+        let filename = zip_entry_name_init(stream_idx);
+        let crc = crc32fast::hash(init_data);
+        let file_size = init_data.len() as u64;
+        let zip_header = make_zip_local_file_header(filename.as_bytes(), crc, 0, file_size, file_size);
+        let free_header = make_free_header(zip_header.len() + init_data.len());
+
+        let zip_local_header_offset = current_offset + 8;
+        zip_file_entries.push(ZipFileEntry {
+            filename: filename.into_bytes(),
+            crc32: crc,
+            compressed_size: file_size,
+            uncompressed_size: file_size,
+            compression_method: 0,
+            local_header_offset: zip_local_header_offset,
+        });
+
+        // free_header + zip_header as inline data
+        let mut header_data = Vec::with_capacity(8 + zip_header.len());
+        header_data.extend_from_slice(&free_header);
+        header_data.extend_from_slice(&zip_header);
+        recipe_chunks.push(make_data_chunk(current_offset, header_data.clone()));
+        current_offset += header_data.len() as u64;
+
+        // init file as file reference
+        let init_abs_path = fs::canonicalize(json_base_dir.join(_source_name))
+            .expect("Failed to canonicalize init path");
+        let init_rel_to_recipe = relative_path(&recipe_base_dir, &init_abs_path)
+            .to_string_lossy()
+            .to_string();
+        recipe_chunks.push(make_file_chunk(
+            current_offset,
+            init_rel_to_recipe,
+            init_data,
+        ));
+        current_offset += init_data.len() as u64;
     }
 
     // --- ZIP central directory and end records (wrapped in free box for MP4 compatibility) ---
