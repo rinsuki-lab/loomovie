@@ -28,13 +28,6 @@ enum Commands {
         /// End byte offset (exclusive), defaults to end of file
         end: Option<u64>,
     },
-    /// Validate a generated MP4 against its sources.json
-    Validate {
-        /// Path to the sources.json file
-        sources_json: String,
-        /// Path to the combined MP4 file (cat prefix.init.m4s prefix.data.m4s)
-        mp4: String,
-    },
 }
 
 fn main() {
@@ -60,9 +53,6 @@ fn main() {
             end,
         } => {
             cmd::bin::run(&recipe_pb, start, end);
-        }
-        Commands::Validate { sources_json, mp4 } => {
-            cmd::validate::run(&sources_json, &mp4);
         }
     }
 }
