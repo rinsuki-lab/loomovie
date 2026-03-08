@@ -1,6 +1,6 @@
 // MP4 box parsing and construction utilities
 
-use super::binary::*;
+use bytes::{BufMut, BytesMut};
 
 #[derive(Debug, Clone)]
 pub struct BoxInfo {
@@ -14,13 +14,13 @@ pub fn parse_box_at(data: &[u8], offset: usize) -> Option<BoxInfo> {
     if offset + 8 > data.len() {
         return None;
     }
-    let size = read_u32_be(data, offset) as u64;
+    let size = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as u64;
     let box_type: [u8; 4] = data[offset + 4..offset + 8].try_into().unwrap();
     let (header_size, total_size) = if size == 1 {
         if offset + 16 > data.len() {
             return None;
         }
-        let ext = read_u64_be(data, offset + 8);
+        let ext = u64::from_be_bytes(data[offset + 8..offset + 16].try_into().unwrap());
         (16, ext as usize)
     } else if size == 0 {
         (8, data.len() - offset)
@@ -74,26 +74,71 @@ pub fn fullbox_parse(content: &[u8]) -> (u8, u32, &[u8]) {
 
 // ===== Box Writing =====
 
-pub fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
-    let size = (8 + content.len()) as u32;
-    let mut buf = Vec::with_capacity(size as usize);
-    write_u32_be(&mut buf, size);
-    buf.extend_from_slice(box_type);
-    buf.extend_from_slice(content);
-    buf
+/// Guard returned by `start_box` / `start_fullbox`.
+/// Panics on drop if `finish()` is not called.
+/// Implements `DerefMut<Target = BytesMut>` so callers write directly through the guard.
+#[must_use = "call .finish() to complete the box"]
+pub struct BoxStart<'a> {
+    buf: &'a mut BytesMut,
+    start: usize,
 }
 
-pub fn make_fullbox(box_type: &[u8; 4], version: u8, flags: u32, content: &[u8]) -> Vec<u8> {
-    let size = (12 + content.len()) as u32;
-    let mut buf = Vec::with_capacity(size as usize);
-    write_u32_be(&mut buf, size);
-    buf.extend_from_slice(box_type);
-    buf.push(version);
-    buf.push(((flags >> 16) & 0xFF) as u8);
-    buf.push(((flags >> 8) & 0xFF) as u8);
-    buf.push((flags & 0xFF) as u8);
-    buf.extend_from_slice(content);
-    buf
+impl std::ops::Deref for BoxStart<'_> {
+    type Target = BytesMut;
+    fn deref(&self) -> &BytesMut {
+        self.buf
+    }
+}
+
+impl std::ops::DerefMut for BoxStart<'_> {
+    fn deref_mut(&mut self) -> &mut BytesMut {
+        self.buf
+    }
+}
+
+impl BoxStart<'_> {
+    /// Patch the size field and complete the box.
+    pub fn finish(self) {
+        let size = (self.buf.len() - self.start) as u32;
+        self.buf[self.start..self.start + 4].copy_from_slice(&size.to_be_bytes());
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for BoxStart<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!(
+                "BoxStart dropped without calling finish() — box at offset {} was never completed",
+                self.start
+            );
+        }
+    }
+}
+
+/// Begin writing a box. Returns a guard that must be finished with `.finish()`.
+pub fn start_box<'a>(buf: &'a mut BytesMut, box_type: &[u8; 4]) -> BoxStart<'a> {
+    let start = buf.len();
+    buf.put_u32(0); // placeholder for size
+    buf.put_slice(box_type);
+    BoxStart { buf, start }
+}
+
+/// Begin writing a full box (with version + flags). Returns a guard that must be finished.
+pub fn start_fullbox<'a>(
+    buf: &'a mut BytesMut,
+    box_type: &[u8; 4],
+    version: u8,
+    flags: u32,
+) -> BoxStart<'a> {
+    let start = buf.len();
+    buf.put_u32(0); // placeholder for size
+    buf.put_slice(box_type);
+    buf.put_u8(version);
+    buf.put_u8(((flags >> 16) & 0xFF) as u8);
+    buf.put_u8(((flags >> 8) & 0xFF) as u8);
+    buf.put_u8((flags & 0xFF) as u8);
+    BoxStart { buf, start }
 }
 
 pub fn make_free_header(content_size: usize) -> [u8; 8] {

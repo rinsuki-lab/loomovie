@@ -1,8 +1,8 @@
 // Parsing of init segments and chunk files
 
+use bytes::Bytes;
 use tracing::{debug, trace};
 
-use super::binary::*;
 use super::mp4_box::*;
 use super::types::*;
 
@@ -35,13 +35,13 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
     let mdhd_content = box_content(mdia_content, &mdhd_info);
     let (mdhd_version, _, mdhd_data) = fullbox_parse(mdhd_content);
     let timescale = if mdhd_version == 0 {
-        read_u32_be(mdhd_data, 8)
+        u32::from_be_bytes(mdhd_data[8..8 + 4].try_into().unwrap())
     } else {
-        read_u32_be(mdhd_data, 16)
+        u32::from_be_bytes(mdhd_data[16..16 + 4].try_into().unwrap())
     };
 
     let hdlr_info = find_box(mdia_content, b"hdlr").expect("hdlr not found in mdia");
-    let hdlr_raw = box_raw(mdia_content, &hdlr_info).to_vec();
+    let hdlr_raw = Bytes::copy_from_slice(box_raw(mdia_content, &hdlr_info));
     let hdlr_content = box_content(mdia_content, &hdlr_info);
     let (_, _, hdlr_data) = fullbox_parse(hdlr_content);
     let handler_type: [u8; 4] = hdlr_data[4..8].try_into().unwrap();
@@ -51,22 +51,22 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
     let minf_content = box_content(mdia_content, &minf_info);
 
     let media_header_raw = if let Some(vmhd) = find_box(minf_content, b"vmhd") {
-        box_raw(minf_content, &vmhd).to_vec()
+        Bytes::copy_from_slice(box_raw(minf_content, &vmhd))
     } else if let Some(smhd) = find_box(minf_content, b"smhd") {
-        box_raw(minf_content, &smhd).to_vec()
+        Bytes::copy_from_slice(box_raw(minf_content, &smhd))
     } else if let Some(nmhd) = find_box(minf_content, b"nmhd") {
-        box_raw(minf_content, &nmhd).to_vec()
+        Bytes::copy_from_slice(box_raw(minf_content, &nmhd))
     } else {
         panic!("No media header (vmhd/smhd/nmhd) found in minf");
     };
 
     let dinf_info = find_box(minf_content, b"dinf").expect("dinf not found in minf");
-    let dinf_raw = box_raw(minf_content, &dinf_info).to_vec();
+    let dinf_raw = Bytes::copy_from_slice(box_raw(minf_content, &dinf_info));
 
     let stbl_info = find_box(minf_content, b"stbl").expect("stbl not found in minf");
     let stbl_content = box_content(minf_content, &stbl_info);
     let stsd_info = find_box(stbl_content, b"stsd").expect("stsd not found in stbl");
-    let stsd_raw = box_raw(stbl_content, &stsd_info).to_vec();
+    let stsd_raw = Bytes::copy_from_slice(box_raw(stbl_content, &stsd_info));
 
     // ---- Parse trex defaults ----
     let mvex_info = find_box(moov_content, b"mvex").expect("mvex not found");
@@ -85,10 +85,10 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
         media_header_raw,
         dinf_raw,
         stsd_raw,
-        trex_default_sample_description_index: read_u32_be(trex_data, 4),
-        trex_default_sample_duration: read_u32_be(trex_data, 8),
-        trex_default_sample_size: read_u32_be(trex_data, 12),
-        trex_default_sample_flags: read_u32_be(trex_data, 16),
+        trex_default_sample_description_index: u32::from_be_bytes(trex_data[4..4 + 4].try_into().unwrap()),
+        trex_default_sample_duration: u32::from_be_bytes(trex_data[8..8 + 4].try_into().unwrap()),
+        trex_default_sample_size: u32::from_be_bytes(trex_data[12..12 + 4].try_into().unwrap()),
+        trex_default_sample_flags: u32::from_be_bytes(trex_data[16..16 + 4].try_into().unwrap()),
     }
 }
 
@@ -96,11 +96,11 @@ pub fn parse_init_segment(data: &[u8], new_track_id: u32) -> TrackInfo {
 
 fn parse_tfhd(content: &[u8]) -> TfhdInfo {
     let (_, flags, data) = fullbox_parse(content);
-    let track_id = read_u32_be(data, 0);
+    let track_id = u32::from_be_bytes(data[0..0 + 4].try_into().unwrap());
     let mut pos = 4;
 
     let base_data_offset = if flags & 0x000001 != 0 {
-        let v = read_u64_be(data, pos);
+        let v = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
         Some(v)
     } else {
@@ -108,7 +108,7 @@ fn parse_tfhd(content: &[u8]) -> TfhdInfo {
     };
 
     let sample_description_index = if flags & 0x000002 != 0 {
-        let v = read_u32_be(data, pos);
+        let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         Some(v)
     } else {
@@ -116,7 +116,7 @@ fn parse_tfhd(content: &[u8]) -> TfhdInfo {
     };
 
     let default_sample_duration = if flags & 0x000008 != 0 {
-        let v = read_u32_be(data, pos);
+        let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         Some(v)
     } else {
@@ -124,7 +124,7 @@ fn parse_tfhd(content: &[u8]) -> TfhdInfo {
     };
 
     let default_sample_size = if flags & 0x000010 != 0 {
-        let v = read_u32_be(data, pos);
+        let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         Some(v)
     } else {
@@ -132,7 +132,7 @@ fn parse_tfhd(content: &[u8]) -> TfhdInfo {
     };
 
     let default_sample_flags = if flags & 0x000020 != 0 {
-        let v = read_u32_be(data, pos);
+        let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         Some(v)
     } else {
         None
@@ -152,9 +152,9 @@ fn parse_tfhd(content: &[u8]) -> TfhdInfo {
 fn parse_tfdt(content: &[u8]) -> TfdtInfo {
     let (version, _, data) = fullbox_parse(content);
     let base_media_decode_time = if version == 0 {
-        read_u32_be(data, 0) as u64
+        u32::from_be_bytes(data[0..0 + 4].try_into().unwrap()) as u64
     } else {
-        read_u64_be(data, 0)
+        u64::from_be_bytes(data[0..0 + 8].try_into().unwrap())
     };
     TfdtInfo {
         version,
@@ -164,11 +164,11 @@ fn parse_tfdt(content: &[u8]) -> TfdtInfo {
 
 fn parse_trun(content: &[u8]) -> TrunInfo {
     let (version, flags, data) = fullbox_parse(content);
-    let sample_count = read_u32_be(data, 0);
+    let sample_count = u32::from_be_bytes(data[0..0 + 4].try_into().unwrap());
     let mut pos = 4;
 
     let data_offset = if flags & 0x000001 != 0 {
-        let v = read_i32_be(data, pos);
+        let v = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         Some(v)
     } else {
@@ -176,7 +176,7 @@ fn parse_trun(content: &[u8]) -> TrunInfo {
     };
 
     let first_sample_flags = if flags & 0x000004 != 0 {
-        let v = read_u32_be(data, pos);
+        let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
         Some(v)
     } else {
@@ -191,28 +191,28 @@ fn parse_trun(content: &[u8]) -> TrunInfo {
     let mut samples = Vec::with_capacity(sample_count as usize);
     for _ in 0..sample_count {
         let duration = if has_duration {
-            let v = read_u32_be(data, pos);
+            let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
             Some(v)
         } else {
             None
         };
         let size = if has_size {
-            let v = read_u32_be(data, pos);
+            let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
             Some(v)
         } else {
             None
         };
         let sample_flags = if has_flags {
-            let v = read_u32_be(data, pos);
+            let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
             Some(v)
         } else {
             None
         };
         let composition_time_offset_raw = if has_cts {
-            let v = read_u32_be(data, pos);
+            let v = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
             Some(v)
         } else {

@@ -4,42 +4,43 @@
 // with a moov containing full sample tables (stbl) whose chunk offsets skip over
 // the fMP4 headers embedded in the source files.
 
-use super::binary::*;
+use bytes::{BufMut, BytesMut};
+
 use super::mp4_box::*;
 use super::types::*;
 
 // ===== moov children =====
 
-fn generate_mvhd(timescale: u32, duration: u64, next_track_id: u32) -> Vec<u8> {
+fn generate_mvhd(buf: &mut BytesMut, timescale: u32, duration: u64, next_track_id: u32) {
     // Use version 1 (64-bit times) when duration overflows u32
     let use_v1 = duration > u32::MAX as u64;
-    let mut data = Vec::new();
+    let mut buf = start_fullbox(buf, b"mvhd", if use_v1 { 1 } else { 0 }, 0);
     if use_v1 {
-        write_u64_be(&mut data, 0); // creation_time
-        write_u64_be(&mut data, 0); // modification_time
-        write_u32_be(&mut data, timescale);
-        write_u64_be(&mut data, duration);
+        buf.put_u64(0); // creation_time
+        buf.put_u64(0); // modification_time
+        buf.put_u32(timescale);
+        buf.put_u64(duration);
     } else {
-        write_u32_be(&mut data, 0); // creation_time
-        write_u32_be(&mut data, 0); // modification_time
-        write_u32_be(&mut data, timescale);
-        write_u32_be(&mut data, duration as u32);
+        buf.put_u32(0); // creation_time
+        buf.put_u32(0); // modification_time
+        buf.put_u32(timescale);
+        buf.put_u32(duration as u32);
     }
-    write_u32_be(&mut data, 0x00010000); // rate = 1.0
-    data.extend_from_slice(&[0x01, 0x00]); // volume = 1.0
-    data.extend_from_slice(&[0u8; 10]); // reserved
+    buf.put_u32(0x00010000); // rate = 1.0
+    buf.put_slice(&[0x01, 0x00]); // volume = 1.0
+    buf.put_slice(&[0u8; 10]); // reserved
     // Identity matrix
     for &v in &[0x00010000u32, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000] {
-        write_u32_be(&mut data, v);
+        buf.put_u32(v);
     }
-    data.extend_from_slice(&[0u8; 24]); // pre_defined
-    write_u32_be(&mut data, next_track_id);
-    make_fullbox(b"mvhd", if use_v1 { 1 } else { 0 }, 0, &data)
+    buf.put_slice(&[0u8; 24]); // pre_defined
+    buf.put_u32(next_track_id);
+    buf.finish();
 }
 
 // ===== stbl children =====
 
-fn generate_stts(durations: &[u32]) -> Vec<u8> {
+fn generate_stts(buf: &mut BytesMut, durations: &[u32]) {
     // Run-length encode consecutive equal durations
     let mut entries: Vec<(u32, u32)> = Vec::new();
     for &d in durations {
@@ -52,16 +53,16 @@ fn generate_stts(durations: &[u32]) -> Vec<u8> {
         entries.push((1, d));
     }
 
-    let mut data = Vec::new();
-    write_u32_be(&mut data, entries.len() as u32);
+    let mut buf = start_fullbox(buf, b"stts", 0, 0);
+    buf.put_u32(entries.len() as u32);
     for &(count, delta) in &entries {
-        write_u32_be(&mut data, count);
-        write_u32_be(&mut data, delta);
+        buf.put_u32(count);
+        buf.put_u32(delta);
     }
-    make_fullbox(b"stts", 0, 0, &data)
+    buf.finish();
 }
 
-fn generate_ctts(offsets: &[i32], version: u8) -> Vec<u8> {
+fn generate_ctts(buf: &mut BytesMut, offsets: &[i32], version: u8) {
     // Run-length encode consecutive equal offsets
     let mut entries: Vec<(u32, i32)> = Vec::new();
     for &o in offsets {
@@ -74,20 +75,20 @@ fn generate_ctts(offsets: &[i32], version: u8) -> Vec<u8> {
         entries.push((1, o));
     }
 
-    let mut data = Vec::new();
-    write_u32_be(&mut data, entries.len() as u32);
+    let mut buf = start_fullbox(buf, b"ctts", version, 0);
+    buf.put_u32(entries.len() as u32);
     for &(count, offset) in &entries {
-        write_u32_be(&mut data, count);
+        buf.put_u32(count);
         if version == 0 {
-            write_u32_be(&mut data, offset as u32);
+            buf.put_u32(offset as u32);
         } else {
-            write_i32_be(&mut data, offset);
+            buf.put_i32(offset);
         }
     }
-    make_fullbox(b"ctts", version, 0, &data)
+    buf.finish();
 }
 
-fn generate_stsz(sizes: &[u32]) -> Vec<u8> {
+fn generate_stsz(buf: &mut BytesMut, sizes: &[u32]) {
     // If all sizes are equal, use the compact form (sample_size != 0)
     let uniform = if !sizes.is_empty() && sizes.iter().all(|&s| s == sizes[0]) {
         sizes[0]
@@ -95,18 +96,18 @@ fn generate_stsz(sizes: &[u32]) -> Vec<u8> {
         0
     };
 
-    let mut data = Vec::new();
-    write_u32_be(&mut data, uniform);
-    write_u32_be(&mut data, sizes.len() as u32);
+    let mut buf = start_fullbox(buf, b"stsz", 0, 0);
+    buf.put_u32(uniform);
+    buf.put_u32(sizes.len() as u32);
     if uniform == 0 {
         for &s in sizes {
-            write_u32_be(&mut data, s);
+            buf.put_u32(s);
         }
     }
-    make_fullbox(b"stsz", 0, 0, &data)
+    buf.finish();
 }
 
-fn generate_stsc(samples_per_chunk: &[u32]) -> Vec<u8> {
+fn generate_stsc(buf: &mut BytesMut, samples_per_chunk: &[u32]) {
     // Run-length encode: record an entry only when samples_per_chunk changes
     let mut entries: Vec<(u32, u32)> = Vec::new(); // (first_chunk 1-based, samples_per_chunk)
     for (i, &count) in samples_per_chunk.iter().enumerate() {
@@ -119,53 +120,53 @@ fn generate_stsc(samples_per_chunk: &[u32]) -> Vec<u8> {
         entries.push((chunk_1based, count));
     }
 
-    let mut data = Vec::new();
-    write_u32_be(&mut data, entries.len() as u32);
+    let mut buf = start_fullbox(buf, b"stsc", 0, 0);
+    buf.put_u32(entries.len() as u32);
     for &(first_chunk, spc) in &entries {
-        write_u32_be(&mut data, first_chunk);
-        write_u32_be(&mut data, spc);
-        write_u32_be(&mut data, 1); // sample_description_index
+        buf.put_u32(first_chunk);
+        buf.put_u32(spc);
+        buf.put_u32(1); // sample_description_index
     }
-    make_fullbox(b"stsc", 0, 0, &data)
+    buf.finish();
 }
 
-fn generate_co64(offsets: &[u64]) -> Vec<u8> {
-    let mut data = Vec::new();
-    write_u32_be(&mut data, offsets.len() as u32);
+fn generate_co64(buf: &mut BytesMut, offsets: &[u64]) {
+    let mut buf = start_fullbox(buf, b"co64", 0, 0);
+    buf.put_u32(offsets.len() as u32);
     for &o in offsets {
-        write_u64_be(&mut data, o);
+        buf.put_u64(o);
     }
-    make_fullbox(b"co64", 0, 0, &data)
+    buf.finish();
 }
 
-fn generate_stss(sync_samples: &[u32]) -> Vec<u8> {
-    let mut data = Vec::new();
-    write_u32_be(&mut data, sync_samples.len() as u32);
+fn generate_stss(buf: &mut BytesMut, sync_samples: &[u32]) {
+    let mut buf = start_fullbox(buf, b"stss", 0, 0);
+    buf.put_u32(sync_samples.len() as u32);
     for &s in sync_samples {
-        write_u32_be(&mut data, s);
+        buf.put_u32(s);
     }
-    make_fullbox(b"stss", 0, 0, &data)
+    buf.finish();
 }
 
 // ===== stbl =====
 
-fn generate_stbl(stsd_raw: &[u8], st: &TrackSampleTable) -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(stsd_raw);
-    content.extend_from_slice(&generate_stts(&st.sample_durations));
+fn generate_stbl(buf: &mut BytesMut, stsd_raw: &[u8], st: &TrackSampleTable) {
+    let mut buf = start_box(buf, b"stbl");
+    buf.put_slice(stsd_raw);
+    generate_stts(&mut buf, &st.sample_durations);
     if st.has_cts {
-        content.extend_from_slice(&generate_ctts(&st.cts_offsets, st.cts_version));
+        generate_ctts(&mut buf, &st.cts_offsets, st.cts_version);
     }
-    content.extend_from_slice(&generate_stsc(&st.samples_per_chunk));
-    content.extend_from_slice(&generate_stsz(&st.sample_sizes));
-    content.extend_from_slice(&generate_co64(&st.chunk_offsets));
+    generate_stsc(&mut buf, &st.samples_per_chunk);
+    generate_stsz(&mut buf, &st.sample_sizes);
+    generate_co64(&mut buf, &st.chunk_offsets);
 
     // stss only needed when not every sample is a sync sample
     if !st.sync_samples.is_empty() && st.sync_samples.len() < st.sample_sizes.len() {
-        content.extend_from_slice(&generate_stss(&st.sync_samples));
+        generate_stss(&mut buf, &st.sync_samples);
     }
 
-    make_box(b"stbl", &content)
+    buf.finish();
 }
 
 // ===== trak (with full stbl) =====
@@ -200,21 +201,18 @@ fn patch_mdhd_duration(mdhd: &mut [u8], duration: u64) {
     }
 }
 
-/// Generate an edts box with an elst entry for initial media time offset.
+/// Write an edts box with an elst entry for initial media time offset.
 ///
-/// This creates an edit list that maps:
-///   - An empty edit of `empty_duration` (in movie timescale) at the start
-///   - A media edit covering the rest, starting at `media_time` (in media timescale)
-///
-/// If media_start_time is 0, returns None (no edit list needed).
+/// If media_start_time is 0, writes nothing.
 fn generate_edts(
+    buf: &mut BytesMut,
     media_start_time: u64,
     media_duration: u64,
     track_timescale: u32,
     movie_timescale: u32,
-) -> Option<Vec<u8>> {
+) {
     if media_start_time == 0 {
-        return None;
+        return;
     }
 
     // Convert media_start_time from track timescale to movie timescale for the empty edit
@@ -230,48 +228,47 @@ fn generate_edts(
         || media_segment_duration_movie > u32::MAX as u64
         || media_start_time > u32::MAX as u64;
 
-    let mut elst_data = Vec::new();
-    if media_start_time > 0 {
-        // Two entries: empty edit + media edit
-        write_u32_be(&mut elst_data, 2);
-    } else {
-        write_u32_be(&mut elst_data, 1);
-    }
+    let mut edts = start_box(buf, b"edts");
+    let mut elst = start_fullbox(&mut edts, b"elst", if use_v1 { 1 } else { 0 }, 0);
 
-    if media_start_time > 0 {
-        // Entry 1: empty edit (segment_duration, media_time=-1)
-        if use_v1 {
-            write_u64_be(&mut elst_data, empty_duration_movie);
-            write_i64_be(&mut elst_data, -1); // media_time = -1 means empty
-        } else {
-            write_u32_be(&mut elst_data, empty_duration_movie as u32);
-            write_i32_be(&mut elst_data, -1);
-        }
-        write_u16_be(&mut elst_data, 1); // media_rate_integer
-        write_u16_be(&mut elst_data, 0); // media_rate_fraction
+    // Two entries: empty edit + media edit
+    elst.put_u32(2);
+
+    // Entry 1: empty edit (segment_duration, media_time=-1)
+    if use_v1 {
+        elst.put_u64(empty_duration_movie);
+        elst.put_i64(-1); // media_time = -1 means empty
+    } else {
+        elst.put_u32(empty_duration_movie as u32);
+        elst.put_i32(-1);
     }
+    elst.put_u16(1); // media_rate_integer
+    elst.put_u16(0); // media_rate_fraction
 
     // Entry 2: media edit (play all media from time 0)
     if use_v1 {
-        write_u64_be(&mut elst_data, media_segment_duration_movie);
-        write_i64_be(&mut elst_data, 0); // media_time = 0 (media starts at sample 0)
+        elst.put_u64(media_segment_duration_movie);
+        elst.put_i64(0); // media_time = 0 (media starts at sample 0)
     } else {
-        write_u32_be(&mut elst_data, media_segment_duration_movie as u32);
-        write_i32_be(&mut elst_data, 0);
+        elst.put_u32(media_segment_duration_movie as u32);
+        elst.put_i32(0);
     }
-    write_u16_be(&mut elst_data, 1); // media_rate_integer
-    write_u16_be(&mut elst_data, 0); // media_rate_fraction
+    elst.put_u16(1); // media_rate_integer
+    elst.put_u16(0); // media_rate_fraction
 
-    let elst = make_fullbox(b"elst", if use_v1 { 1 } else { 0 }, 0, &elst_data);
-    Some(make_box(b"edts", &elst))
+    elst.finish();
+    edts.finish();
 }
 
-/// Build a complete trak box for Hybrid MP4 output.
-pub fn generate_hybrid_trak(
+/// Build a complete trak box for Hybrid MP4 output, writing directly to `buf`.
+fn generate_hybrid_trak(
+    buf: &mut BytesMut,
     track: &TrackInfo,
     st: &TrackSampleTable,
     movie_timescale: u32,
-) -> Vec<u8> {
+) {
+    let mut trak = start_box(buf, b"trak");
+
     // Patch tkhd: set duration in movie timescale (includes initial empty edit)
     let mut tkhd = track.tkhd_raw.clone();
     let media_duration_movie = if track.timescale == movie_timescale {
@@ -286,44 +283,35 @@ pub fn generate_hybrid_trak(
     };
     let tkhd_duration = empty_duration_movie + media_duration_movie;
     patch_tkhd_duration(&mut tkhd, tkhd_duration);
+    trak.put_slice(&tkhd);
 
-    // Patch mdhd: set duration in track timescale
-    let mut mdhd = track.mdhd_raw.clone();
-    patch_mdhd_duration(&mut mdhd, st.total_duration);
-
-    // Generate edts/elst if there's an initial media offset
-    let edts = generate_edts(
+    // edts (optional, writes nothing if media_start_time == 0)
+    generate_edts(
+        &mut trak,
         st.media_start_time,
         st.total_duration,
         track.timescale,
         movie_timescale,
     );
 
-    // Build stbl
-    let stbl = generate_stbl(&track.stsd_raw, st);
-
-    // minf = media_header + dinf + stbl
-    let mut minf_content = Vec::new();
-    minf_content.extend_from_slice(&track.media_header_raw);
-    minf_content.extend_from_slice(&track.dinf_raw);
-    minf_content.extend_from_slice(&stbl);
-    let minf = make_box(b"minf", &minf_content);
+    // Patch mdhd: set duration in track timescale
+    let mut mdhd = track.mdhd_raw.clone();
+    patch_mdhd_duration(&mut mdhd, st.total_duration);
 
     // mdia = mdhd + hdlr + minf
-    let mut mdia_content = Vec::new();
-    mdia_content.extend_from_slice(&mdhd);
-    mdia_content.extend_from_slice(&track.hdlr_raw);
-    mdia_content.extend_from_slice(&minf);
-    let mdia = make_box(b"mdia", &mdia_content);
+    let mut mdia = start_box(&mut trak, b"mdia");
+    mdia.put_slice(&mdhd);
+    mdia.put_slice(&track.hdlr_raw);
 
-    // trak = tkhd + [edts] + mdia
-    let mut trak_content = Vec::new();
-    trak_content.extend_from_slice(&tkhd);
-    if let Some(ref edts_box) = edts {
-        trak_content.extend_from_slice(edts_box);
-    }
-    trak_content.extend_from_slice(&mdia);
-    make_box(b"trak", &trak_content)
+    // minf = media_header + dinf + stbl
+    let mut minf = start_box(&mut mdia, b"minf");
+    minf.put_slice(&track.media_header_raw);
+    minf.put_slice(&track.dinf_raw);
+    generate_stbl(&mut minf, &track.stsd_raw, st);
+    minf.finish();
+
+    mdia.finish();
+    trak.finish();
 }
 
 // ===== Generate Hybrid moov =====
@@ -356,24 +344,26 @@ pub fn generate_hybrid_moov(
         .max()
         .unwrap_or(0);
 
-    let mvhd = generate_mvhd(movie_timescale, movie_duration, max_track_id + 1);
-
-    let mut moov_content = mvhd;
+    let mut buf = BytesMut::new();
+    let mut moov = start_box(&mut buf, b"moov");
+    generate_mvhd(&mut moov, movie_timescale, movie_duration, max_track_id + 1);
     for (track, st) in tracks.iter().zip(sample_tables.iter()) {
-        moov_content.extend_from_slice(&generate_hybrid_trak(track, st, movie_timescale));
+        generate_hybrid_trak(&mut moov, track, st, movie_timescale);
     }
-
-    make_box(b"moov", &moov_content)
+    moov.finish();
+    buf.into()
 }
 
 // ===== Generate ftyp =====
 
 pub fn generate_ftyp() -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(b"isom"); // major_brand
-    write_u32_be(&mut content, 0x200); // minor_version
-    content.extend_from_slice(b"isom");
-    content.extend_from_slice(b"iso6");
-    content.extend_from_slice(b"mp41");
-    make_box(b"ftyp", &content)
+    let mut buf = BytesMut::with_capacity(28); // 8 (box header) + 20 (content)
+    let mut ftyp = start_box(&mut buf, b"ftyp");
+    ftyp.put_slice(b"isom"); // major_brand
+    ftyp.put_u32(0x200); // minor_version
+    ftyp.put_slice(b"isom");
+    ftyp.put_slice(b"iso6");
+    ftyp.put_slice(b"mp41");
+    ftyp.finish();
+    buf.into()
 }

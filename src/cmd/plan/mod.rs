@@ -19,7 +19,6 @@
 // while m3u8 playlists use method 8 (deflated). Entry names use the pattern:
 // streams.N/init.m4s, streams.N/chunks/chunk.NNNNNN.m4s, and generated.m3u8.
 
-mod binary;
 mod boxes;
 mod hls;
 mod mp4_box;
@@ -31,6 +30,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use prost::Message;
@@ -387,19 +387,19 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     // --- mdat header ---
     let mdat_header = if mdat_header_size == 16 {
         let total_mdat_box_size = mdat_header_size + total_mdat_payload;
-        let mut buf = Vec::with_capacity(16);
-        buf.extend_from_slice(&1u32.to_be_bytes()); // size=1 (use extended)
-        buf.extend_from_slice(b"mdat");
-        buf.extend_from_slice(&total_mdat_box_size.to_be_bytes());
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u32(1); // size=1 (use extended)
+        buf.put_slice(b"mdat");
+        buf.put_u64(total_mdat_box_size);
         buf
     } else {
         let total_mdat_box_size = (mdat_header_size + total_mdat_payload) as u32;
-        let mut buf = Vec::with_capacity(8);
-        buf.extend_from_slice(&total_mdat_box_size.to_be_bytes());
-        buf.extend_from_slice(b"mdat");
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u32(total_mdat_box_size);
+        buf.put_slice(b"mdat");
         buf
     };
-    recipe_chunks.push(make_data_chunk(current_offset, mdat_header.clone()));
+    recipe_chunks.push(make_data_chunk(current_offset, mdat_header.to_vec()));
     current_offset += mdat_header.len() as u64;
 
     // --- mdat content: zip local headers + chunk files ---
@@ -419,7 +419,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
             // Record ZIP entry for central directory
             zip_file_entries.push(ZipFileEntry {
-                filename: filename.into_bytes(),
+                filename: Bytes::from(filename.into_bytes()),
                 crc32: crc,
                 compressed_size: file_size,
                 uncompressed_size: file_size,
@@ -471,7 +471,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
         let zip_local_header_offset = *current_offset + 8;
         zip_file_entries.push(ZipFileEntry {
-            filename: entry_name.to_vec(),
+            filename: Bytes::from(entry_name.to_vec()),
             crc32: crc,
             compressed_size,
             uncompressed_size,
@@ -479,11 +479,11 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             local_header_offset: zip_local_header_offset,
         });
 
-        let mut chunk = Vec::with_capacity(8 + zip_header.len() + compressed.len());
-        chunk.extend_from_slice(&free_header);
-        chunk.extend_from_slice(&zip_header);
-        chunk.extend_from_slice(&compressed);
-        recipe_chunks.push(make_data_chunk(*current_offset, chunk.clone()));
+        let mut chunk = BytesMut::with_capacity(8 + zip_header.len() + compressed.len());
+        chunk.put_slice(&free_header);
+        chunk.put_slice(&zip_header);
+        chunk.put_slice(&compressed);
+        recipe_chunks.push(make_data_chunk(*current_offset, chunk.to_vec()));
         *current_offset += chunk.len() as u64;
     };
 
@@ -534,7 +534,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
         let zip_local_header_offset = current_offset + 8;
         zip_file_entries.push(ZipFileEntry {
-            filename: filename.into_bytes(),
+            filename: Bytes::from(filename.into_bytes()),
             crc32: crc,
             compressed_size: file_size,
             uncompressed_size: file_size,
@@ -543,10 +543,10 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         });
 
         // free_header + zip_header as inline data
-        let mut header_data = Vec::with_capacity(8 + zip_header.len());
-        header_data.extend_from_slice(&free_header);
-        header_data.extend_from_slice(&zip_header);
-        recipe_chunks.push(make_data_chunk(current_offset, header_data.clone()));
+        let mut header_data = BytesMut::with_capacity(8 + zip_header.len());
+        header_data.put_slice(&free_header);
+        header_data.put_slice(&zip_header);
+        recipe_chunks.push(make_data_chunk(current_offset, header_data.to_vec()));
         current_offset += header_data.len() as u64;
 
         // init file as file reference
@@ -567,10 +567,10 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     let cd_offset = current_offset + 8; // 8 bytes for free box header
     let zip_end_data = zip::make_end_records(&zip_file_entries, cd_offset);
     let free_header = make_free_header(zip_end_data.len());
-    let mut zip_end_chunk = Vec::with_capacity(8 + zip_end_data.len());
-    zip_end_chunk.extend_from_slice(&free_header);
-    zip_end_chunk.extend_from_slice(&zip_end_data);
-    recipe_chunks.push(make_data_chunk(current_offset, zip_end_chunk.clone()));
+    let mut zip_end_chunk = BytesMut::with_capacity(8 + zip_end_data.len());
+    zip_end_chunk.put_slice(&free_header);
+    zip_end_chunk.put_slice(&zip_end_data);
+    recipe_chunks.push(make_data_chunk(current_offset, zip_end_chunk.to_vec()));
     current_offset += zip_end_chunk.len() as u64;
 
     // ===== Phase 5: Write recipe.pb =====

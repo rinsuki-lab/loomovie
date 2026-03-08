@@ -1,5 +1,6 @@
 // Data types used throughout the application
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 // ===== Parsed MP4 Structures =====
@@ -56,13 +57,13 @@ pub struct TrackInfo {
     /// Raw mdhd box
     pub mdhd_raw: Vec<u8>,
     /// Raw hdlr box
-    pub hdlr_raw: Vec<u8>,
+    pub hdlr_raw: Bytes,
     /// Raw media header box (vmhd, smhd, or nmhd)
-    pub media_header_raw: Vec<u8>,
+    pub media_header_raw: Bytes,
     /// Raw dinf box
-    pub dinf_raw: Vec<u8>,
+    pub dinf_raw: Bytes,
     /// Raw stsd box
-    pub stsd_raw: Vec<u8>,
+    pub stsd_raw: Bytes,
     #[allow(dead_code)]
     pub trex_default_sample_description_index: u32,
     pub trex_default_sample_duration: u32,
