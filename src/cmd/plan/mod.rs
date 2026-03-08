@@ -452,7 +452,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     }
 
     // --- Trailing ZIP entries (wrapped in free boxes for MP4 compatibility) ---
-    // Order: generated.m3u8, streams.N/generated.m3u8, streams.N/init.m4s, then CD
+    // Order: streams.json, generated.m3u8, streams.N/generated.m3u8, streams.N/init.m4s, then CD
 
     // Helper: emit a small file as a free-box-wrapped ZIP entry with deflate compression
     let emit_zip_entry_deflated = |recipe_chunks: &mut Vec<proto::Chunk>,
@@ -498,6 +498,33 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             is_audio: &tracks[stream_idx].handler_type == b"soun",
         }
     }).collect();
+
+    // 0) Generate streams.generated.json (reproducible input for re-running loomovie on extracted ZIP)
+    {
+        let streams_json = serde_json::json!({
+            "streams": (0..num_streams).map(|stream_idx| {
+                serde_json::json!({
+                    "format": config.streams[stream_idx].format,
+                    "codecs": config.streams[stream_idx].codecs,
+                    "init": zip::entry_name_init(stream_idx),
+                    "chunks": (0..num_chunks).map(|chunk_idx| {
+                        // Chunks are resolved relative to init's parent dir,
+                        // so use path relative to streams.N/
+                        format!("chunks/chunk.{:06}.m4s", chunk_idx)
+                    }).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let streams_json_bytes = serde_json::to_vec_pretty(&streams_json)
+            .expect("Failed to serialize streams.json");
+        emit_zip_entry_deflated(
+            &mut recipe_chunks,
+            &mut zip_file_entries,
+            &mut current_offset,
+            b"streams.generated.json",
+            &streams_json_bytes,
+        );
+    }
 
     // 1) Generate master playlist (generated.m3u8)
     {
