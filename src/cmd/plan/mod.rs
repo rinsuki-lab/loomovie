@@ -29,6 +29,7 @@ mod zip;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use flate2::write::DeflateEncoder;
@@ -85,15 +86,20 @@ fn make_data_chunk(offset: u64, data: Vec<u8>) -> proto::Chunk {
 }
 
 /// Create a recipe Chunk referencing a file
-fn make_file_chunk(offset: u64, file_path: String, file_data: &[u8]) -> proto::Chunk {
-    let crc32 = crc32fast::hash(file_data);
-    let size = file_data.len() as u64;
+fn make_file_chunk(offset: u64, file_path: String, size: u64, crc32: u32) -> proto::Chunk {
     proto::Chunk {
         offset,
         size,
         crc32,
         content: Some(proto::chunk::Content::File(file_path)),
     }
+}
+
+struct LoadedChunk {
+    recipe_rel_path: String,
+    file_size: u64,
+    crc32: u32,
+    parsed: ChunkParseResult,
 }
 
 pub fn run(json_path_str: &str, recipe_path_str: &str) {
@@ -150,10 +156,8 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     }
 
     // ===== Phase 2: Parse all chunks =====
-    // parsed_chunks[stream_idx][chunk_idx] = ChunkParseResult
-    let mut parsed_chunks: Vec<Vec<ChunkParseResult>> = Vec::new();
-    // chunk_file_rel_paths[stream_idx][chunk_idx] = path relative to json_base_dir
-    let mut chunk_file_rel_paths: Vec<Vec<String>> = Vec::new();
+    // loaded_chunks[stream_idx][chunk_idx] = loaded chunk data + parse result
+    let mut loaded_chunks: Vec<Vec<LoadedChunk>> = Vec::new();
 
     for (stream_idx, stream) in config.streams.iter().enumerate() {
         let init_parent = PathBuf::from(&stream.init)
@@ -161,19 +165,26 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             .map(|p| p.to_owned())
             .unwrap_or_default();
 
-        let mut stream_parsed = Vec::new();
-        let mut stream_rel_paths = Vec::new();
+        let mut stream_loaded_chunks = Vec::new();
         for chunk_name in &stream.chunks {
             let chunk_path = json_base_dir.join(&init_parent).join(chunk_name);
             let chunk_data = fs::read(&chunk_path)
                 .unwrap_or_else(|e| panic!("Failed to read chunk {}: {}", chunk_path.display(), e));
+            maybe_log_read_progress(&chunk_path);
             let parsed = parse_chunk(&chunk_data);
-            let relative_source = init_parent.join(chunk_name).to_string_lossy().to_string();
-            stream_parsed.push(parsed);
-            stream_rel_paths.push(relative_source);
+            let chunk_abs_canon = fs::canonicalize(&chunk_path)
+                .expect("Failed to canonicalize chunk path");
+            let chunk_rel_to_recipe = relative_path(&recipe_base_dir, &chunk_abs_canon)
+                .to_string_lossy()
+                .to_string();
+            stream_loaded_chunks.push(LoadedChunk {
+                recipe_rel_path: chunk_rel_to_recipe,
+                file_size: chunk_data.len() as u64,
+                crc32: crc32fast::hash(&chunk_data),
+                parsed,
+            });
         }
-        parsed_chunks.push(stream_parsed);
-        chunk_file_rel_paths.push(stream_rel_paths);
+        loaded_chunks.push(stream_loaded_chunks);
         info!(stream_idx, num_chunks, "parsed chunks for stream");
     }
 
@@ -184,7 +195,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     for chunk_idx in 0..num_chunks {
         let mut sizes = Vec::new();
         for stream_idx in 0..num_streams {
-            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let parsed = &loaded_chunks[stream_idx][chunk_idx].parsed;
             let filename = zip::entry_name_chunk(stream_idx, chunk_idx);
             sizes.push(zip::local_file_header_size(filename.len()) + parsed.file_size);
         }
@@ -230,7 +241,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         let mut stream_chunk_durations: Vec<f64> = Vec::new();
 
         for chunk_idx in 0..num_chunks {
-            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let parsed = &loaded_chunks[stream_idx][chunk_idx].parsed;
             let mut chunk_duration_ticks: u64 = 0;
             for frag in &parsed.fragments {
                 // Record base_media_decode_time from the very first fragment
@@ -369,7 +380,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
-            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
+            let parsed = &loaded_chunks[stream_idx][chunk_idx].parsed;
             let filename = zip::entry_name_chunk(stream_idx, chunk_idx);
             let zip_hdr_size = zip::local_file_header_size(filename.len()) as u64;
 
@@ -424,15 +435,12 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     let mut zip_file_entries: Vec<ZipFileEntry> = Vec::new();
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
-            let ref parsed = parsed_chunks[stream_idx][chunk_idx];
-            let chunk_rel = &chunk_file_rel_paths[stream_idx][chunk_idx];
-
-            let chunk_abs_path = json_base_dir.join(chunk_rel);
-            let chunk_data = fs::read(&chunk_abs_path).unwrap();
+            let loaded_chunk = &loaded_chunks[stream_idx][chunk_idx];
+            let parsed = &loaded_chunk.parsed;
 
             let filename = zip::entry_name_chunk(stream_idx, chunk_idx);
-            let crc = crc32fast::hash(&chunk_data);
-            let file_size = chunk_data.len() as u64;
+            let crc = loaded_chunk.crc32;
+            let file_size = loaded_chunk.file_size;
             let zip_header = zip::make_local_file_header(filename.as_bytes(), crc, 0, file_size, file_size);
 
             // Record ZIP entry for central directory
@@ -451,15 +459,11 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             current_offset += zip_header_len;
 
             // chunk file as file reference
-            let chunk_abs_canon = fs::canonicalize(&chunk_abs_path)
-                .expect("Failed to canonicalize chunk path");
-            let chunk_rel_to_recipe = relative_path(&recipe_base_dir, &chunk_abs_canon)
-                .to_string_lossy()
-                .to_string();
             recipe_chunks.push(make_file_chunk(
                 current_offset,
-                chunk_rel_to_recipe,
-                &chunk_data,
+                loaded_chunk.recipe_rel_path.clone(),
+                loaded_chunk.file_size,
+                loaded_chunk.crc32,
             ));
             current_offset += parsed.file_size as u64;
         }
@@ -507,7 +511,10 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
     // Build per-stream info for HLS playlist generation
     let stream_infos: Vec<hls::StreamInfo> = (0..num_streams).map(|stream_idx| {
-        let chunk_sizes: Vec<u64> = parsed_chunks[stream_idx].iter().map(|c| c.file_size as u64).collect();
+        let chunk_sizes: Vec<u64> = loaded_chunks[stream_idx]
+            .iter()
+            .map(|chunk| chunk.parsed.file_size as u64)
+            .collect();
         let bandwidth = hls::compute_peak_bandwidth(&chunk_sizes, &chunk_durations_sec[stream_idx]);
         hls::StreamInfo {
             codecs: &config.streams[stream_idx].codecs,
@@ -603,7 +610,8 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         recipe_chunks.push(make_file_chunk(
             current_offset,
             init_rel_to_recipe,
-            init_data,
+            init_data.len() as u64,
+            crc,
         ));
         current_offset += init_data.len() as u64;
     }
