@@ -321,6 +321,17 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             "collected sample table"
         );
 
+        if st.has_cts {
+            let min_cts = st.cts_offsets.iter().copied().min().unwrap_or(0);
+            if min_cts < 0 {
+                let shift = (-min_cts) as i32;
+                for offset in &mut st.cts_offsets {
+                    *offset += shift;
+                }
+            }
+            st.cts_version = 0;
+        }
+
         sample_tables.push(st);
     }
 
@@ -337,7 +348,14 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     // (init files are now placed after mdat, as ZIP-only entries)
 
     // Generate moov with placeholder offsets to determine its size
-    let moov_placeholder = generate_hybrid_moov(&tracks, &sample_tables);
+    let moov_placeholder_co64 = generate_hybrid_moov(&tracks, &sample_tables, true);
+    let moov_size_co64 = moov_placeholder_co64.len();
+
+    let init_size_co64 = current_offset as usize + moov_size_co64;
+    let mdat_content_start_co64 = init_size_co64 as u64 + mdat_header_size;
+    let use_co64 = mdat_content_start_co64 + total_mdat_payload > u32::MAX as u64;
+
+    let moov_placeholder = generate_hybrid_moov(&tracks, &sample_tables, use_co64);
     let moov_size = moov_placeholder.len();
 
     let init_size = current_offset as usize + moov_size;
@@ -373,7 +391,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     }
 
     // Regenerate moov with real offsets
-    let moov = generate_hybrid_moov(&tracks, &sample_tables);
+    let moov = generate_hybrid_moov(&tracks, &sample_tables, use_co64);
     assert_eq!(
         moov.len(),
         moov_size,

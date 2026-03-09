@@ -88,6 +88,15 @@ fn generate_ctts(buf: &mut BytesMut, offsets: &[i32], version: u8) {
     buf.finish();
 }
 
+fn generate_stco(buf: &mut BytesMut, offsets: &[u64]) {
+    let mut buf = start_fullbox(buf, b"stco", 0, 0);
+    buf.put_u32(offsets.len() as u32);
+    for &o in offsets {
+        buf.put_u32(o as u32);
+    }
+    buf.finish();
+}
+
 fn generate_stsz(buf: &mut BytesMut, sizes: &[u32]) {
     // If all sizes are equal, use the compact form (sample_size != 0)
     let uniform = if !sizes.is_empty() && sizes.iter().all(|&s| s == sizes[0]) {
@@ -150,7 +159,7 @@ fn generate_stss(buf: &mut BytesMut, sync_samples: &[u32]) {
 
 // ===== stbl =====
 
-fn generate_stbl(buf: &mut BytesMut, stsd_raw: &[u8], st: &TrackSampleTable) {
+fn generate_stbl(buf: &mut BytesMut, stsd_raw: &[u8], st: &TrackSampleTable, use_co64: bool) {
     let mut buf = start_box(buf, b"stbl");
     buf.put_slice(stsd_raw);
     generate_stts(&mut buf, &st.sample_durations);
@@ -159,7 +168,11 @@ fn generate_stbl(buf: &mut BytesMut, stsd_raw: &[u8], st: &TrackSampleTable) {
     }
     generate_stsc(&mut buf, &st.samples_per_chunk);
     generate_stsz(&mut buf, &st.sample_sizes);
-    generate_co64(&mut buf, &st.chunk_offsets);
+    if use_co64 {
+        generate_co64(&mut buf, &st.chunk_offsets);
+    } else {
+        generate_stco(&mut buf, &st.chunk_offsets);
+    }
 
     // stss only needed when not every sample is a sync sample
     if !st.sync_samples.is_empty() && st.sync_samples.len() < st.sample_sizes.len() {
@@ -266,6 +279,7 @@ fn generate_hybrid_trak(
     track: &TrackInfo,
     st: &TrackSampleTable,
     movie_timescale: u32,
+    use_co64: bool,
 ) {
     let mut trak = start_box(buf, b"trak");
 
@@ -307,7 +321,7 @@ fn generate_hybrid_trak(
     let mut minf = start_box(&mut mdia, b"minf");
     minf.put_slice(&track.media_header_raw);
     minf.put_slice(&track.dinf_raw);
-    generate_stbl(&mut minf, &track.stsd_raw, st);
+    generate_stbl(&mut minf, &track.stsd_raw, st, use_co64);
     minf.finish();
 
     mdia.finish();
@@ -320,6 +334,7 @@ fn generate_hybrid_trak(
 pub fn generate_hybrid_moov(
     tracks: &[TrackInfo],
     sample_tables: &[TrackSampleTable],
+    use_co64: bool,
 ) -> Vec<u8> {
     let movie_timescale = tracks[0].timescale;
     let max_track_id = tracks.iter().map(|t| t.new_track_id).max().unwrap_or(0);
@@ -348,7 +363,7 @@ pub fn generate_hybrid_moov(
     let mut moov = start_box(&mut buf, b"moov");
     generate_mvhd(&mut moov, movie_timescale, movie_duration, max_track_id + 1);
     for (track, st) in tracks.iter().zip(sample_tables.iter()) {
-        generate_hybrid_trak(&mut moov, track, st, movie_timescale);
+        generate_hybrid_trak(&mut moov, track, st, movie_timescale, use_co64);
     }
     moov.finish();
     buf.into()
