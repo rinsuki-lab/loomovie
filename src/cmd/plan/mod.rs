@@ -135,6 +135,22 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
 
     info!(num_streams, num_chunks, "processing streams");
 
+    let total_input_files = num_streams * (num_chunks + 1);
+    let mut files_read = 0usize;
+    let mut last_progress_log = Instant::now();
+    let mut maybe_log_read_progress = |path: &Path| {
+        files_read += 1;
+        if last_progress_log.elapsed() >= Duration::from_secs(60) {
+            info!(
+                files_read,
+                total_input_files,
+                path = %path.display(),
+                "input read progress"
+            );
+            last_progress_log = Instant::now();
+        }
+    };
+
     // ===== Phase 1: Parse init segments =====
     let mut tracks: Vec<TrackInfo> = Vec::new();
     let mut init_file_data: Vec<(String, Vec<u8>)> = Vec::new();
@@ -143,6 +159,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         let init_path = json_base_dir.join(&stream.init);
         info!(path = %init_path.display(), "reading init segment");
         let init_data = fs::read(&init_path).expect("Failed to read init segment");
+        maybe_log_read_progress(&init_path);
         let new_track_id = (i + 1) as u32;
         let track_info = parse_init_segment(&init_data, new_track_id);
         info!(
