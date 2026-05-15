@@ -114,10 +114,34 @@ pub struct TrackSampleTable {
     pub cts_offsets: Vec<i32>,
     /// 1-based sample indices of sync (key) samples
     pub sync_samples: Vec<u32>,
-    /// Number of samples in each stbl "chunk" (one per fragment)
+    /// Number of samples in each stbl "chunk".
+    ///
+    /// Each fragment is split into one or more *sub-chunks* whose maximum
+    /// playback duration is bounded (see plan::SUBCHUNK_TARGET_DENOMINATOR) so
+    /// that constrained players don't drop large trailing chunks. The length
+    /// of this Vec equals the number of stbl chunks (= sub-chunks), not the
+    /// number of source fragments.
     pub samples_per_chunk: Vec<u32>,
-    /// Absolute file offset of first sample in each stbl "chunk"
+    /// Absolute file offset of first sample in each stbl "chunk" (sub-chunk).
+    /// Same length as `samples_per_chunk`.
     pub chunk_offsets: Vec<u64>,
+    /// Per-sub-chunk metadata used to fill in `chunk_offsets` once the moov
+    /// size (and thus mdat start) is known. Same length as `chunk_offsets`.
+    pub sub_chunks: Vec<SubChunkInfo>,
+}
+
+/// Locates a sub-chunk within the original input layout so its absolute byte
+/// offset can be computed once the mdat position is finalized.
+#[derive(Debug, Clone)]
+pub struct SubChunkInfo {
+    /// 0-based index into `loaded_chunks[stream_idx][..]` (the source m4s file).
+    pub chunk_file_idx: u32,
+    /// 0-based index of the fragment within that m4s file (typically 0).
+    pub fragment_idx: u16,
+    /// Byte offset from the start of the fragment's sample data to this
+    /// sub-chunk's first sample (i.e. sum of `stsz` of preceding samples
+    /// within the same fragment).
+    pub byte_offset_in_fragment: u32,
 }
 
 // ===== JSON Types =====

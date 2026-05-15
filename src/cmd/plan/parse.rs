@@ -259,6 +259,16 @@ pub fn parse_chunk(data: &[u8]) -> ChunkParseResult {
                 let tfhd_box = find_box(traf_content, b"tfhd").expect("tfhd not found in traf");
                 let tfhd = parse_tfhd(box_content(traf_content, &tfhd_box));
 
+                // TODO: Phase 4 currently assumes trun.data_offset is
+                // moof-relative (the CMAF / DASH / HLS default-base-is-moof
+                // case). If tfhd.base_data_offset is set, the absolute
+                // sample data position would need to honor it instead.
+                // Reject upfront rather than emit silently broken offsets.
+                assert!(
+                    tfhd.base_data_offset.is_none(),
+                    "tfhd.base_data_offset is not supported yet"
+                );
+
                 let tfdt = find_box(traf_content, b"tfdt")
                     .map(|info| parse_tfdt(box_content(traf_content, &info)));
 

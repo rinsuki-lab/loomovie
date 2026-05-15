@@ -15,6 +15,11 @@
 // the original chunk files, skipping over fMP4 structural boxes (moof, mdat
 // headers etc.) that are embedded verbatim.
 //
+// Each source fragment is split into one or more sub-chunks whose maximum
+// playback duration is bounded (see `SUBCHUNK_TARGET_DENOMINATOR`) so that
+// constrained downstream MP4 players don't drop large trailing chunks. The
+// mdat byte layout is unchanged by this; only stsc/stco gain extra entries.
+//
 // The file is also a valid ZIP archive. Media/init files use method 0 (stored),
 // while m3u8 playlists use method 8 (deflated). Entry names use the pattern:
 // streams.N/init.m4s, streams.N/chunks/chunk.NNNNNN.m4s, and generated.m3u8.
@@ -45,6 +50,13 @@ use self::types::*;
 use crate::proto;
 
 use self::zip::ZipFileEntry;
+
+/// Maximum playback duration of a single stbl chunk, expressed as
+/// `track.timescale / SUBCHUNK_TARGET_DENOMINATOR` ticks. With a denominator
+/// of 2 each sub-chunk is at most ~0.5 seconds long, which matches what
+/// mainstream encoders (e.g. Apple) emit and avoids "last chunk dropped"
+/// behavior seen on some constrained players.
+const SUBCHUNK_TARGET_DENOMINATOR: u64 = 2;
 
 /// Compute a relative path from `base` to `target`.
 /// Both paths should be absolute (canonicalized) for reliable results.
@@ -251,7 +263,14 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
             sync_samples: Vec::new(),
             samples_per_chunk: Vec::new(),
             chunk_offsets: Vec::new(),
+            sub_chunks: Vec::new(),
         };
+
+        // Maximum sub-chunk duration, in track timescale ticks. We cap each
+        // stbl chunk so its playback duration is <= this value to keep the
+        // worst-case "trailing chunk dropped" loss small on quirky players.
+        let subchunk_target_ticks: u64 =
+            (track.timescale as u64 / SUBCHUNK_TARGET_DENOMINATOR).max(1);
 
         let mut sample_number: u32 = 0;
         let mut is_first_fragment = true;
@@ -260,7 +279,7 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
         for chunk_idx in 0..num_chunks {
             let parsed = &loaded_chunks[stream_idx][chunk_idx].parsed;
             let mut chunk_duration_ticks: u64 = 0;
-            for frag in &parsed.fragments {
+            for (frag_idx, frag) in parsed.fragments.iter().enumerate() {
                 // Record base_media_decode_time from the very first fragment
                 if is_first_fragment {
                     if let Some(ref tfdt) = frag.tfdt {
@@ -268,10 +287,15 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                     }
                     is_first_fragment = false;
                 }
-                let frag_sample_count = frag.trun.sample_count;
-                st.samples_per_chunk.push(frag_sample_count);
-                st.chunk_offsets.push(0); // placeholder — filled in after moov size is known
 
+                // Sub-chunk accumulators (reset at each sub-chunk boundary)
+                let mut sub_byte_offset_in_frag: u32 = 0;
+                let mut sub_start_byte_offset: u32 = 0;
+                let mut sub_sample_count: u32 = 0;
+                let mut sub_dur_ticks: u64 = 0;
+                let mut sub_open = false;
+
+                let total_samples_in_frag = frag.trun.samples.len();
                 for (i, sample) in frag.trun.samples.iter().enumerate() {
                     sample_number += 1;
 
@@ -292,6 +316,19 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                             .unwrap_or(track.trex_default_sample_size)
                     });
                     st.sample_sizes.push(size);
+
+                    // Open a new sub-chunk if needed.
+                    if !sub_open {
+                        sub_start_byte_offset = sub_byte_offset_in_frag;
+                        sub_sample_count = 0;
+                        sub_dur_ticks = 0;
+                        sub_open = true;
+                    }
+                    sub_sample_count += 1;
+                    sub_dur_ticks += duration as u64;
+                    sub_byte_offset_in_frag = sub_byte_offset_in_frag
+                        .checked_add(size)
+                        .expect("sample byte offset overflow within a single fragment");
 
                     // Flags (for sync sample detection)
                     let flags = if i == 0 {
@@ -334,7 +371,46 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
                     } else if st.has_cts {
                         st.cts_offsets.push(0);
                     }
+
+                    // Close the current sub-chunk when the *next* sample
+                    // would push it past the target, or when this was the
+                    // last sample of the fragment (sub-chunks must not
+                    // cross fragment boundaries because each fragment is a
+                    // separately addressable region inside mdat). Closing
+                    // before the overshoot keeps every sub-chunk's playback
+                    // duration <= subchunk_target_ticks; a sub-chunk that
+                    // contains a single sample longer than the target is
+                    // still allowed because we cannot split a single sample.
+                    let last_sample_in_frag = i + 1 == total_samples_in_frag;
+                    let next_dur = if last_sample_in_frag {
+                        0
+                    } else {
+                        let next = &frag.trun.samples[i + 1];
+                        next.duration.unwrap_or_else(|| {
+                            frag.tfhd
+                                .default_sample_duration
+                                .unwrap_or(track.trex_default_sample_duration)
+                        }) as u64
+                    };
+                    let would_overshoot =
+                        sub_dur_ticks + next_dur > subchunk_target_ticks;
+                    if last_sample_in_frag || would_overshoot {
+                        st.samples_per_chunk.push(sub_sample_count);
+                        st.chunk_offsets.push(0); // placeholder, filled in Phase 4
+                        st.sub_chunks.push(SubChunkInfo {
+                            chunk_file_idx: u32::try_from(chunk_idx)
+                                .expect("chunk_idx exceeds u32"),
+                            fragment_idx: u16::try_from(frag_idx)
+                                .expect("more than 65535 fragments in a single chunk file"),
+                            byte_offset_in_fragment: sub_start_byte_offset,
+                        });
+                        sub_open = false;
+                    }
                 }
+                debug_assert!(
+                    !sub_open,
+                    "sub-chunk left open at end of fragment (would lose samples)"
+                );
             }
             stream_chunk_durations.push(chunk_duration_ticks as f64 / track.timescale as f64);
         }
@@ -387,34 +463,50 @@ pub fn run(json_path_str: &str, recipe_path_str: &str) {
     let moov_size = moov_placeholder.len();
 
     let init_size = current_offset as usize + moov_size;
-
-    // Now compute real chunk offsets
-    // mdat content starts at init_size + mdat_header_size
     let mdat_content_start = init_size as u64 + mdat_header_size;
 
-    let mut data_pos: u64 = 0; // offset within mdat content
-    let mut chunk_offset_cursor: Vec<usize> = vec![0; num_streams]; // per-stream stbl chunk index
+    // Now compute real chunk offsets.
+    //
+    // Each m4s chunk file is laid out at a known position in mdat. Within
+    // each fragment, sub-chunks are addressed by their byte offset from the
+    // start of the fragment's sample data.
 
+    // Pass 1: record absolute file offset of every (stream, chunk_file)
+    //         data start, then advance data_pos.
+    let mut chunk_file_starts: Vec<Vec<u64>> = vec![vec![0u64; num_chunks]; num_streams];
+    let mut data_pos: u64 = 0; // offset within mdat content
     for chunk_idx in 0..num_chunks {
         for stream_idx in 0..num_streams {
             let parsed = &loaded_chunks[stream_idx][chunk_idx].parsed;
             let filename = zip::entry_name_chunk(stream_idx, chunk_idx);
             let zip_hdr_size = zip::local_file_header_size(filename.len()) as u64;
-
-            // This chunk file's data starts at:
-            let chunk_file_start = mdat_content_start + data_pos + zip_hdr_size;
-
-            // Each fragment within this chunk file becomes one stbl chunk
-            for frag in &parsed.fragments {
-                let sample_data_abs =
-                    chunk_file_start + frag.moof_offset as u64 + frag.original_data_offset as u64;
-
-                let stbl_chunk_idx = chunk_offset_cursor[stream_idx];
-                sample_tables[stream_idx].chunk_offsets[stbl_chunk_idx] = sample_data_abs;
-                chunk_offset_cursor[stream_idx] += 1;
-            }
-
+            chunk_file_starts[stream_idx][chunk_idx] =
+                mdat_content_start + data_pos + zip_hdr_size;
             data_pos += zip_hdr_size + parsed.file_size as u64;
+        }
+    }
+
+    // Pass 2: fill each sub-chunk's absolute offset.
+    for stream_idx in 0..num_streams {
+        let st = &mut sample_tables[stream_idx];
+        for (i, sub) in st.sub_chunks.iter().enumerate() {
+            let parsed = &loaded_chunks[stream_idx][sub.chunk_file_idx as usize].parsed;
+            let frag = &parsed.fragments[sub.fragment_idx as usize];
+            let chunk_file_start = chunk_file_starts[stream_idx][sub.chunk_file_idx as usize];
+            // `original_data_offset` is i32 (offset from moof start to first
+            // sample); the source DASH/HLS pipelines we target produce only
+            // non-negative values, but compute defensively.
+            let frag_data_abs = chunk_file_start
+                .checked_add(frag.moof_offset as u64)
+                .and_then(|v| {
+                    if frag.original_data_offset >= 0 {
+                        v.checked_add(frag.original_data_offset as u64)
+                    } else {
+                        v.checked_sub((-(frag.original_data_offset as i64)) as u64)
+                    }
+                })
+                .expect("fragment data offset overflow");
+            st.chunk_offsets[i] = frag_data_abs + sub.byte_offset_in_fragment as u64;
         }
     }
 
